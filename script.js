@@ -1,99 +1,96 @@
-// script.js
-const symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT', 'XRPUSDT', 'DOTUSDT']; // Lista resumida para o exemplo
-const marketData = {};
-const alerts = [];
+const spotSymbols = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC']; // Top USDC Spot
+const futSymbols = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'XRPUSDC', 'DOGEUSDC']; // Top USDC Perps
 
-// Conexão via WebSocket (Streams de Agregado de Trades)
-const socket = new WebSocket('wss://stream.binance.com:9443/ws');
+const state = { spot: {}, futures: {}, alerts: [] };
 
-const subscribeMsg = {
-    method: "SUBSCRIBE",
-    params: symbols.map(s => `${s.toLowerCase()}@aggTrade`),
-    id: 1
-};
+// Iniciar WebSockets
+const wsSpot = new WebSocket('wss://stream.binance.com:9443/ws');
+const wsFut = new WebSocket('wss://fstream.binance.com/ws');
 
-socket.onopen = () => {
-    socket.send(JSON.stringify(subscribeMsg));
-    console.log("Conectado à Binance WebSocket");
-};
+function initWS(ws, symbols, type) {
+    ws.onopen = () => {
+        const msg = { method: "SUBSCRIBE", params: symbols.map(s => `${s.toLowerCase()}@aggTrade`), id: type === 'spot' ? 1 : 2 };
+        ws.send(JSON.stringify(msg));
+    };
 
-socket.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.e === 'aggTrade') {
-        updateMarketData(data);
-    }
-};
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.e === 'aggTrade') updateData(data, type);
+    };
+}
 
-function updateMarketData(trade) {
+initWS(wsSpot, spotSymbols, 'spot');
+initWS(wsFut, futSymbols, 'futures');
+
+function updateData(trade, type) {
     const symbol = trade.s;
     const price = parseFloat(trade.p);
-    const quantity = parseFloat(trade.q);
-    const isBuyerMaker = trade.m; // m: true = Vendedor agressivo, m: false = Comprador agressivo
+    const qty = parseFloat(trade.q);
+    const isSellerAggressive = trade.m; 
 
-    if (!marketData[symbol]) {
-        marketData[symbol] = { buyVol: 0, sellVol: 0, price: 0 };
-    }
-
-    marketData[symbol].price = price;
+    if (!state[type][symbol]) state[type][symbol] = { buyVol: 0, sellVol: 0, price: 0 };
     
-    if (isBuyerMaker) {
-        marketData[symbol].sellVol += quantity;
-    } else {
-        marketData[symbol].buyVol += quantity;
+    const coin = state[type][symbol];
+    coin.price = price;
+    isSellerAggressive ? (coin.sellVol += qty) : (coin.buyVol += qty);
+
+    renderRow(symbol, type);
+    checkPriceAlerts(symbol, price);
+}
+
+function renderRow(symbol, type) {
+    const data = state[type][symbol];
+    const tbody = document.getElementById(`${type}Body`);
+    let row = document.getElementById(`${type}-${symbol}`);
+
+    if (!row) {
+        row = tbody.insertRow();
+        row.id = `${type}-${symbol}`;
     }
 
-    renderTable();
-    checkAlerts(symbol, price);
+    const total = data.buyVol + data.sellVol;
+    const bPerc = ((data.buyVol / total) * 100).toFixed(1);
+    const sPerc = ((data.sellVol / total) * 100).toFixed(1);
+    const agg = bPerc > 52 ? 'COMPRA 🚀' : (sPerc > 52 ? 'VENDA 🔥' : 'NEUTRO');
+
+    row.innerHTML = `
+        <td>${symbol}</td>
+        <td>$${data.price.toFixed(4)}</td>
+        <td class="buy">${bPerc}%</td>
+        <td class="sell">${sPerc}%</td>
+        <td><strong>${agg}</strong></td>
+        <td><button class="alert-btn" onclick="setQuickAlert('${symbol}', ${data.price})">🔔 Alert</button></td>
+    `;
 }
 
-function renderTable() {
-    const tbody = document.getElementById('marketBody');
-    tbody.innerHTML = '';
-
-    Object.keys(marketData).forEach(symbol => {
-        const data = marketData[symbol];
-        const totalVol = data.buyVol + data.sellVol;
-        const buyRatio = (data.buyVol / totalVol * 100).toFixed(1);
-        const sellRatio = (data.sellVol / totalVol * 100).toFixed(1);
-        
-        const side = data.buyVol > data.sellVol ? 'Compradores' : 'Vendedores';
-        const aggressive = buyRatio > 55 ? 'Compra Forte' : (sellRatio > 55 ? 'Venda Forte' : 'Equilibrado');
-
-        const row = `
-            <tr>
-                <td>**${symbol}**</td>
-                <td>$${data.price.toLocaleString()}</td>
-                <td class="buy">${buyRatio}%</td>
-                <td class="sell">${sellRatio}%</td>
-                <td class="aggressive">${aggressive}</td>
-                <td>${side} movimentando</td>
-            </tr>
-        `;
-        tbody.innerHTML += row;
-    });
+// Lógica de Alertas
+function setQuickAlert(symbol, currentPrice) {
+    const target = prompt(`Definir alerta para ${symbol}. Preço atual: ${currentPrice}\nDigite o preço alvo (acima ou abaixo):`);
+    if (target) {
+        state.alerts.push({
+            symbol,
+            target: parseFloat(target),
+            direction: parseFloat(target) > currentPrice ? 'UP' : 'DOWN'
+        });
+        alert(`Alerta definido para ${symbol} em $${target}`);
+    }
 }
 
-// Sistema de Alertas
-function setAlert() {
-    const symbol = document.getElementById('alertSymbol').value.toUpperCase();
-    const min = parseFloat(document.getElementById('minPrice').value);
-    const max = parseFloat(document.getElementById('maxPrice').value);
-
-    alerts.push({ symbol, min, max });
-    document.getElementById('activeAlerts').innerHTML += `<p>Alerta: ${symbol} (${min} - ${max})</p>`;
-}
-
-function checkAlerts(symbol, price) {
-    alerts.forEach((alert, index) => {
+function checkPriceAlerts(symbol, price) {
+    state.alerts.forEach((alert, index) => {
         if (alert.symbol === symbol) {
-            if (price <= alert.min || price >= alert.max) {
-                alertNotification(symbol, price);
-                alerts.splice(index, 1); // Remove após disparar
+            if ((alert.direction === 'UP' && price >= alert.target) || 
+                (alert.direction === 'DOWN' && price <= alert.target)) {
+                
+                alert(`🚨 ALERTA: ${symbol} cruzou ${alert.target}! Preço atual: ${price}`);
+                state.alerts.splice(index, 1);
             }
         }
     });
 }
 
-function alertNotification(symbol, price) {
-    alert(`ALERTA: ${symbol} atingiu o preço de $${price}!`);
+function switchTab(tab) {
+    document.getElementById('spotSection').classList.toggle('hidden', tab !== 'spot');
+    document.getElementById('futuresSection').classList.toggle('hidden', tab !== 'futures');
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.innerText.toLowerCase().includes(tab)));
 }

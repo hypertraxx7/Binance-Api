@@ -2,48 +2,52 @@
 <html lang="pt">
 <head>
     <meta charset="UTF-8">
-    <title>Binance Real-Time Monitor</title>
+    <title>Multi-Market USDC Monitor</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #121212; color: white; margin: 20px; }
-        .container { display: flex; flex-direction: column; gap: 20px; }
-        table { width: 100%; border-collapse: collapse; background: #1e1e1e; border-radius: 8px; overflow: hidden; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
-        th { background: #2d2d2d; color: #f0b90b; }
-        .buy { color: #0ecb81; }
-        .sell { color: #f6465d; }
-        .alert-box { background: #2d2d2d; padding: 15px; border-radius: 8px; border: 1px solid #f0b90b; }
-        input { background: #333; border: 1px solid #444; color: white; padding: 5px; border-radius: 4px; }
-        .aggressive { font-weight: bold; text-transform: uppercase; }
+        body { font-family: 'Inter', sans-serif; background: #0b0e11; color: #eaecef; margin: 20px; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .tab-btn { background: #2b3139; border: none; color: white; padding: 10px 20px; cursor: pointer; border-radius: 4px; }
+        .tab-btn.active { background: #f0b90b; color: black; font-weight: bold; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #2b3139; }
+        th { color: #848e9c; font-weight: 400; }
+        
+        .buy { color: #0ecb81; } .sell { color: #f6465d; }
+        .alert-btn { background: #333; border: 1px solid #444; color: #f0b90b; cursor: pointer; padding: 4px 8px; border-radius: 3px; font-size: 11px; }
+        .alert-active { background: #f0b90b1a; border-color: #f0b90b; }
+        
+        .hidden { display: none; }
     </style>
 </head>
 <body>
 
-    <h2>Binance Live Market Monitor (Top 50 USDT)</h2>
-    
-    <div class="alert-box">
-        <h3>Configurar Alerta</h3>
-        <input type="text" id="alertSymbol" placeholder="Ex: BTCUSDT">
-        <input type="number" id="minPrice" placeholder="Preço Mínimo">
-        <input type="number" id="maxPrice" placeholder="Preço Máximo">
-        <button onclick="setAlert()">Definir Alerta</button>
-        <div id="activeAlerts"></div>
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('spot')">USDC SPOT</button>
+        <button class="tab-btn" onclick="switchTab('futures')">USDC FUTURES (PERP)</button>
     </div>
 
-    <table id="marketTable">
-        <thead>
-            <tr>
-                <th>Símbolo</th>
-                <th>Preço</th>
-                <th>Vol. Comprador</th>
-                <th>Vol. Vendedor</th>
-                <th>Agressividade</th>
-                <th>Lado Dominante</th>
-            </tr>
-        </thead>
-        <tbody id="marketBody">
-            <!-- Dados inseridos via JS -->
-        </tbody>
-    </table>
+    <div id="spotSection">
+        <table id="spotTable">
+            <thead>
+                <tr>
+                    <th>Símbolo</th><th>Preço</th><th>Vol Buy%</th><th>Vol Sell%</th><th>Agressividade</th><th>Alerta</th>
+                </tr>
+            </thead>
+            <tbody id="spotBody"></tbody>
+        </table>
+    </div>
+
+    <div id="futuresSection" class="hidden">
+        <table id="futuresTable">
+            <thead>
+                <tr>
+                    <th>Símbolo</th><th>Preço</th><th>Vol Buy%</th><th>Vol Sell%</th><th>Agressividade</th><th>Alerta</th>
+                </tr>
+            </thead>
+            <tbody id="futuresBody"></tbody>
+        </table>
+    </div>
 
     <script src="script.js"></script>
 </body>
