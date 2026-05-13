@@ -1,4 +1,4 @@
-// app.js
+// script.js
 const symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT', 'XRPUSDT', 'DOTUSDT']; // Lista resumida para o exemplo
 const marketData = {};
 const alerts = [];
