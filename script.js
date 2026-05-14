@@ -1,5 +1,5 @@
 /**
- * script.js
+ * binance-flow.js
  * ────────────────────────────────────────────────────────────
  * Recolha em tempo real da Binance via WebSocket
  *   • Top 25 Spot USDC
