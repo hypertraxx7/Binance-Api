@@ -1,617 +1,843 @@
 /**
- * binance-flow.js
- * ────────────────────────────────────────────────────────────
- * Recolha em tempo real da Binance via WebSocket
- *   • Top 25 Spot USDC
- *   • Top 25 Futures Perp USDT
+ * binance-ws.js
+ * ═══════════════════════════════════════════════════════════════
+ * Recolha de dados em tempo real via WebSocket — Binance API
  *
- * Mostra por símbolo:
- *   • Volume compradores vs vendedores (acumulado na sessão)
- *   • Quem está a movimentar mais o mercado
+ * Suporta:
+ *   • Top N Spot   USDC  — aggTrade + bookTicker + miniTicker
+ *   • Top N Futures USDT — aggTrade + bookTicker + miniTicker
+ *
+ * Métricas calculadas por símbolo:
+ *   • Volume comprador vs vendedor (USDC/USDT) — sessão + janela deslizante
+ *   • Impacto no preço por lado (buyers vs sellers)
  *   • Pressão de compra/venda em tempo real
+ *   • Delta de fluxo (1 min, 5 min, sessão)
+ *   • Bid/Ask spread em tempo real
  *
- * Dependências:
- *   npm install ws node-fetch
+ * Compatível com:
+ *   • Node.js  — npm install ws
+ *   • Browser  — usar directamente (usa WebSocket nativo)
  *
- * Execução:
- *   node binance-flow.js
- * ────────────────────────────────────────────────────────────
+ * Uso (Node.js):
+ *   const bws = require('./binance-ws')
+ *   await bws.start({ topN: 25, markets: ['spot','futures'] })
+ *   bws.on('tick',   data => console.log(data))
+ *   bws.on('update', data => console.log(data))
+ *
+ * Uso (Browser — módulo ES):
+ *   import * as bws from './binance-ws.js'
+ *   await bws.start({ topN: 25 })
+ *   bws.on('tick', data => renderUI(data))
+ * ═══════════════════════════════════════════════════════════════
  */
 
-'use strict'
-
-const WebSocket = require('ws')
-const https     = require('https')
-
-// ─── CONFIGURAÇÃO ────────────────────────────────────────────
-
-const CFG = {
-  TOP_N          : 25,
-  REST_TIMEOUT   : 8_000,
-  REFRESH_SECS   : 30,        // recarregar ranking de volume a cada N segundos
-  PRINT_SECS     : 5,         // intervalo de output no terminal
-  WINDOW_MS      : 60_000,    // janela deslizante de trades (1 minuto)
-  RECONNECT_MS   : 4_000,
-
-  SPOT_REST  : 'https://api.binance.com/api/v3/ticker/24hr',
-  FUT_REST   : 'https://fapi.binance.com/fapi/v1/ticker/24hr',
-
-  SPOT_WS    : 'wss://stream.binance.com:9443/stream',
-  FUT_WS     : 'wss://fstream.binance.com/stream',
-
-  EXCL       : ['UP','DOWN','BULL','BEAR','3L','3S','LEVERAGE','HEDGE'],
-}
-
-// ─── ANSI CORES ──────────────────────────────────────────────
-
-const C = {
-  rst  : '\x1b[0m',
-  dim  : '\x1b[2m',
-  bold : '\x1b[1m',
-  grn  : '\x1b[32m',
-  red  : '\x1b[31m',
-  ylw  : '\x1b[33m',
-  cyn  : '\x1b[36m',
-  blu  : '\x1b[34m',
-  mag  : '\x1b[35m',
-  wht  : '\x1b[97m',
-  bgGrn: '\x1b[42m',
-  bgRed: '\x1b[41m',
-  bgYlw: '\x1b[43m',
-}
-
-// ─── ESTADO GLOBAL ───────────────────────────────────────────
-
-/**
- * Estrutura por símbolo:
- * {
- *   symbol      : string,
- *   market      : 'spot' | 'futures',
- *   price       : number,
- *   prevPrice   : number,
- *   change24h   : number,
- *   quoteVol24h : number,           // volume 24h em USDC/USDT (REST)
- *   trades      : Array<{ts, qty, quoteQty, isBuy}>,  // janela deslizante
- *   buyQty      : number,           // acumulado sessão (base asset)
- *   sellQty     : number,
- *   buyQuote    : number,           // acumulado sessão (USDC/USDT)
- *   sellQuote   : number,
- *   tradeCount  : number,
- *   lastTrade   : number,           // timestamp ms
- * }
- */
-const STATE = {
-  spot    : new Map(),   // symbol → dados
-  futures : new Map(),
-  spotSyms   : [],       // lista ordenada top 25
-  futSyms    : [],
-  ws      : { spot: null, futures: null },
-  running : false,
-}
-
-// ─── UTILITÁRIOS ─────────────────────────────────────────────
-
-function httpsGet(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: CFG.REST_TIMEOUT }, res => {
-      let raw = ''
-      res.on('data', c => raw += c)
-      res.on('end', () => {
-        try { resolve(JSON.parse(raw)) }
-        catch (e) { reject(e) }
-      })
-    })
-    req.on('error', reject)
-    req.on('timeout', () => { req.destroy(); reject(new Error('REST timeout')) })
-  })
-}
-
-function isExcluded(sym) {
-  return CFG.EXCL.some(e => sym.includes(e))
-}
-
-function fmtNum(n, dec = 2) {
-  if (n === null || n === undefined || isNaN(n)) return '—'
-  return n.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec })
-}
-
-function fmtVol(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return n.toFixed(2)
-}
-
-function fmtPrice(n) {
-  if (!n) return '—'
-  if (n >= 10000)  return fmtNum(n, 2)
-  if (n >= 100)    return fmtNum(n, 3)
-  if (n >= 1)      return fmtNum(n, 4)
-  if (n >= 0.01)   return fmtNum(n, 5)
-  return fmtNum(n, 6)
-}
-
-function pad(str, len, right = false) {
-  const s = String(str)
-  if (right) return s.slice(0, len).padEnd(len)
-  return s.slice(0, len).padStart(len)
-}
-
-function bar(ratio, width = 16) {
-  // ratio: 0–100, preenche de compradores (esquerda) para vendedores (direita)
-  const filled = Math.round((ratio / 100) * width)
-  const buy  = '█'.repeat(filled)
-  const sell = '░'.repeat(width - filled)
-  return C.grn + buy + C.red + sell + C.rst
-}
-
-// ─── COLHER DADOS REST ───────────────────────────────────────
-
-async function fetchTopSpotUSDC() {
-  log(C.dim + '  → Buscando top ' + CFG.TOP_N + ' Spot USDC...' + C.rst)
-  const tickers = await httpsGet(CFG.SPOT_REST)
-  const filtered = tickers
-    .filter(t => t.symbol.endsWith('USDC') && !isExcluded(t.symbol))
-    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-    .slice(0, CFG.TOP_N)
-
-  STATE.spotSyms = filtered.map(t => t.symbol)
-
-  filtered.forEach((t, i) => {
-    const existing = STATE.spot.get(t.symbol) || {}
-    STATE.spot.set(t.symbol, {
-      ...existing,
-      symbol      : t.symbol,
-      market      : 'spot',
-      rank        : i + 1,
-      price       : parseFloat(t.lastPrice),
-      prevPrice   : existing.price || parseFloat(t.lastPrice),
-      change24h   : parseFloat(t.priceChangePercent),
-      quoteVol24h : parseFloat(t.quoteVolume),
-      buyQty      : existing.buyQty    || 0,
-      sellQty     : existing.sellQty   || 0,
-      buyQuote    : existing.buyQuote  || 0,
-      sellQuote   : existing.sellQuote || 0,
-      tradeCount  : existing.tradeCount || 0,
-      trades      : existing.trades    || [],
-      lastTrade   : existing.lastTrade || 0,
-    })
-  })
-  log(C.grn + '  ✓ ' + STATE.spotSyms.length + ' pares Spot USDC carregados' + C.rst)
-}
-
-async function fetchTopFuturesUSDT() {
-  log(C.dim + '  → Buscando top ' + CFG.TOP_N + ' Futures USDT...' + C.rst)
-  const tickers = await httpsGet(CFG.FUT_REST)
-  const filtered = tickers
-    .filter(t => t.symbol.endsWith('USDT') && !isExcluded(t.symbol))
-    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-    .slice(0, CFG.TOP_N)
-
-  STATE.futSyms = filtered.map(t => t.symbol)
-
-  filtered.forEach((t, i) => {
-    const existing = STATE.futures.get(t.symbol) || {}
-    STATE.futures.set(t.symbol, {
-      ...existing,
-      symbol      : t.symbol,
-      market      : 'futures',
-      rank        : i + 1,
-      price       : parseFloat(t.lastPrice),
-      prevPrice   : existing.price || parseFloat(t.lastPrice),
-      change24h   : parseFloat(t.priceChangePercent),
-      quoteVol24h : parseFloat(t.quoteVolume),
-      buyQty      : existing.buyQty    || 0,
-      sellQty     : existing.sellQty   || 0,
-      buyQuote    : existing.buyQuote  || 0,
-      sellQuote   : existing.sellQuote || 0,
-      tradeCount  : existing.tradeCount || 0,
-      trades      : existing.trades    || [],
-      lastTrade   : existing.lastTrade || 0,
-    })
-  })
-  log(C.grn + '  ✓ ' + STATE.futSyms.length + ' pares Futures USDT carregados' + C.rst)
-}
-
-// ─── PROCESSAR TRADES ────────────────────────────────────────
-
-/**
- * Cada mensagem aggTrade da Binance:
- *   s  = symbol
- *   p  = price (string)
- *   q  = quantity (string)
- *   m  = isBuyerMaker
- *        true  → vendedor foi agressivo (SELL taker)
- *        false → comprador foi agressivo (BUY taker)
- *   T  = timestamp ms
- */
-function processTrade(map, data) {
-  const sym = data.s
-  const entry = map.get(sym)
-  if (!entry) return
-
-  const price    = parseFloat(data.p)
-  const qty      = parseFloat(data.q)
-  const quoteQty = price * qty
-  const isBuy    = !data.m          // m=false → BUY agressivo
-  const ts       = data.T
-
-  // Acumulado total da sessão
-  if (isBuy) {
-    entry.buyQty   += qty
-    entry.buyQuote += quoteQty
+;(function (root, factory) {
+  // UMD — funciona em Node.js (CommonJS), browser (global) e bundlers (AMD)
+  if (typeof module !== 'undefined' && module.exports) {
+    const WS = (typeof WebSocket !== 'undefined') ? WebSocket : require('ws')
+    module.exports = factory(WS)
+  } else if (typeof define === 'function' && define.amd) {
+    define([], () => factory(WebSocket))
   } else {
-    entry.sellQty   += qty
-    entry.sellQuote += quoteQty
+    root.BinanceWS = factory(WebSocket)
   }
-  entry.tradeCount++
-  entry.prevPrice = entry.price
-  entry.price     = price
-  entry.lastTrade = ts
+}(typeof globalThis !== 'undefined' ? globalThis : this, function (WS) {
+  'use strict'
 
-  // Janela deslizante (último minuto)
-  entry.trades.push({ ts, qty, quoteQty, isBuy })
-  const cutoff = ts - CFG.WINDOW_MS
-  while (entry.trades.length > 0 && entry.trades[0].ts < cutoff) {
-    entry.trades.shift()
+  // ─────────────────────────────────────────────────────────────
+  // DEFAULTS
+  // ─────────────────────────────────────────────────────────────
+  const DEFAULTS = {
+    topN:            25,          // quantos símbolos por mercado
+    markets:         ['spot', 'futures'],
+    quoteAsset:      'USDT',       // futuras — mantido para compatibilidade
+    spotQuote:       'USDC',       // spot usa USDC
+    futuresQuote:    'USDT',       // futures usa USDT
+    windowMs:        60_000,      // janela deslizante curta (1 min)
+    windowMs5:       300_000,     // janela deslizante longa (5 min)
+    refreshMs:       30_000,      // re-rank via REST
+    reconnectMs:     3_000,       // atraso de reconexão WS
+    maxReconnects:   0,           // 0 = ilimitado
+    excludeKeywords: ['UP','DOWN','BULL','BEAR','3L','3S','LEVERAGE','HEDGE'],
+    debug:           false,
   }
-}
 
-// ─── CALCULAR MÉTRICAS ───────────────────────────────────────
-
-function computeMetrics(entry) {
-  const totalQuote = entry.buyQuote + entry.sellQuote
-  const buyRatio   = totalQuote > 0 ? (entry.buyQuote / totalQuote) * 100 : 50
-
-  // Janela deslizante (último minuto)
-  let winBuy = 0, winSell = 0
-  for (const t of entry.trades) {
-    if (t.isBuy) winBuy  += t.quoteQty
-    else         winSell += t.quoteQty
+  // Endpoints
+  const ENDPOINTS = {
+    spot: {
+      rest:      'https://api.binance.com/api/v3/ticker/24hr',
+      streamBase:'wss://stream.binance.com:9443/stream',
+    },
+    futures: {
+      rest:      'https://fapi.binance.com/fapi/v1/ticker/24hr',
+      streamBase:'wss://fstream.binance.com/stream',
+    },
   }
-  const winTotal    = winBuy + winSell
-  const winBuyRatio = winTotal > 0 ? (winBuy / winTotal) * 100 : 50
-  const winDelta    = winBuy - winSell          // positivo = compradores dominam
 
-  // Pressão: índice -100 a +100
-  // Combina ratio de sessão (40%) + ratio janela (60%)
-  const pressure = ((buyRatio - 50) * 0.4 + (winBuyRatio - 50) * 0.6) * 2
-
-  // Classificação
-  let signal, signalColor
-  if      (pressure >=  60) { signal = '🔥🔥 COMPRA EXTREMA';  signalColor = C.bgGrn + C.wht }
-  else if (pressure >=  30) { signal = '🔥  COMPRA FORTE   ';  signalColor = C.grn + C.bold }
-  else if (pressure >=  10) { signal = '↑   COMPRADORES    ';  signalColor = C.grn }
-  else if (pressure >=  -10){ signal = '⚖   EQUILÍBRIO     ';  signalColor = C.ylw }
-  else if (pressure >= -30) { signal = '↓   VENDEDORES     ';  signalColor = C.red }
-  else if (pressure >= -60) { signal = '📉  VENDA FORTE    ';  signalColor = C.red + C.bold }
-  else                       { signal = '💀  VENDA EXTREMA  ';  signalColor = C.bgRed + C.wht }
-
-  return {
-    buyRatio,
-    winBuyRatio,
-    winDelta,
-    winBuy,
-    winSell,
-    pressure,
-    signal,
-    signalColor,
-    totalQuote,
-    totalTrades: entry.tradeCount,
+  // ─────────────────────────────────────────────────────────────
+  // ESTADO INTERNO
+  // ─────────────────────────────────────────────────────────────
+  /**
+   * symbols   — Map<market, string[]>           lista ordenada por rank
+   * entries   — Map<market, Map<sym, Entry>>     dados por símbolo
+   * sockets   — Map<market+streamType, WSConn>  conexões activas
+   * listeners — Map<event, Set<fn>>             callbacks
+   * opts      — opções mescladas com DEFAULTS
+   * running   — boolean
+   */
+  const _state = {
+    symbols:   { spot: [], futures: [] },
+    entries:   { spot: new Map(), futures: new Map() },
+    sockets:   new Map(),
+    listeners: new Map(),
+    opts:      null,
+    running:   false,
+    refreshTimer: null,
   }
-}
 
-// ─── WEBSOCKET ───────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // ESTRUTURA DE UMA ENTRY
+  // ─────────────────────────────────────────────────────────────
+  /**
+   * @typedef {Object} Entry
+   * @property {string}   symbol
+   * @property {string}   market          'spot' | 'futures'
+   * @property {number}   rank            posição no ranking de volume
+   * @property {number}   price           último preço negociado
+   * @property {number}   prevPrice       preço anterior (para flash/delta)
+   * @property {number}   priceOpen       preço de abertura 24h
+   * @property {number}   priceHigh       máximo 24h
+   * @property {number}   priceLow        mínimo 24h
+   * @property {number}   change24h       variação % 24h
+   * @property {number}   vol24hBase      volume 24h (base asset)
+   * @property {number}   vol24hQuote     volume 24h (USDC para spot, USDT para futures)
+   * @property {number}   bidPrice        melhor compra (order book)
+   * @property {number}   askPrice        melhor venda  (order book)
+   * @property {number}   spread          spread bid/ask absoluto
+   * @property {number}   spreadPct       spread bid/ask em %
+   *
+   * — Sessão (desde início) —
+   * @property {number}   sessionBuyQty   quantidade comprada (base)
+   * @property {number}   sessionSellQty  quantidade vendida  (base)
+   * @property {number}   sessionBuyVol   volume comprador   (USDC ou USDT conforme mercado)
+   * @property {number}   sessionSellVol  volume vendedor    (USDC ou USDT conforme mercado)
+   * @property {number}   sessionTrades   nº total de trades
+   * @property {number}   sessionBuyImpact   impacto comprador no preço (ponderado por vol)
+   * @property {number}   sessionSellImpact  impacto vendedor  no preço
+   *
+   * — Janela 1 min —
+   * @property {number}   win1BuyVol
+   * @property {number}   win1SellVol
+   * @property {number}   win1Delta       buy - sell (USDC ou USDT)
+   * @property {number}   win1BuyImpact
+   * @property {number}   win1SellImpact
+   * @property {number}   win1Trades
+   *
+   * — Janela 5 min —
+   * @property {number}   win5BuyVol
+   * @property {number}   win5SellVol
+   * @property {number}   win5Delta
+   * @property {number}   win5Trades
+   *
+   * — Derivados —
+   * @property {number}   buyRatio        % de compra na sessão (0-100)
+   * @property {number}   win1BuyRatio    % de compra na janela 1min
+   * @property {number}   win5BuyRatio    % de compra na janela 5min
+   * @property {number}   pressure        pressão combinada -100 a +100
+   * @property {number}   impactRatio     % de impacto dos compradores (0-100)
+   * @property {string}   signal          classificação textual
+   * @property {string}   signalKey       'extreme_buy'|'strong_buy'|'buy'|'neutral'|'sell'|'strong_sell'|'extreme_sell'
+   * @property {number}   lastTs          timestamp do último trade
+   * @property {Array}    _trades         array de trades (janela deslizante interna)
+   */
+  function createEntry(symbol, market, rank, ticker) {
+    return {
+      symbol,
+      market,
+      rank,
+      price:        +ticker.lastPrice,
+      prevPrice:    +ticker.lastPrice,
+      priceOpen:    +ticker.openPrice,
+      priceHigh:    +ticker.highPrice,
+      priceLow:     +ticker.lowPrice,
+      change24h:    +ticker.priceChangePercent,
+      vol24hBase:   +ticker.volume,
+      vol24hQuote:  +ticker.quoteVolume,
+      bidPrice:     0,
+      askPrice:     0,
+      spread:       0,
+      spreadPct:    0,
 
-function buildStreams(symbols, type) {
-  // aggTrade + miniTicker por símbolo
-  return symbols.map(s => s.toLowerCase() + '@aggTrade').join('/')
-}
+      sessionBuyQty:     0,
+      sessionSellQty:    0,
+      sessionBuyVol:     0,
+      sessionSellVol:    0,
+      sessionTrades:     0,
+      sessionBuyImpact:  0,
+      sessionSellImpact: 0,
 
-function connectSpotWS() {
-  if (!STATE.spotSyms.length) return
-  const streams = buildStreams(STATE.spotSyms, 'spot')
-  const url     = CFG.SPOT_WS + '?streams=' + streams
+      win1BuyVol:    0,
+      win1SellVol:   0,
+      win1Delta:     0,
+      win1BuyImpact: 0,
+      win1SellImpact:0,
+      win1Trades:    0,
 
-  log(C.dim + '  → WS Spot conectando (' + STATE.spotSyms.length + ' streams)...' + C.rst)
-  const ws = new WebSocket(url)
-  STATE.ws.spot = ws
+      win5BuyVol:    0,
+      win5SellVol:   0,
+      win5Delta:     0,
+      win5Trades:    0,
 
-  ws.on('open',    () => log(C.grn + '  ✓ WS Spot USDC conectado' + C.rst))
-  ws.on('message', raw => {
-    try {
-      const msg  = JSON.parse(raw)
-      const data = msg.data || msg
-      if (data.e === 'aggTrade') processTrade(STATE.spot, data)
-    } catch (_) {}
-  })
-  ws.on('error',   err => log(C.red + '  ✗ WS Spot erro: ' + err.message + C.rst))
-  ws.on('close',   () => {
-    log(C.ylw + '  ↺ WS Spot fechado — reconectando em ' + CFG.RECONNECT_MS/1000 + 's...' + C.rst)
-    setTimeout(connectSpotWS, CFG.RECONNECT_MS)
-  })
-}
+      buyRatio:      50,
+      win1BuyRatio:  50,
+      win5BuyRatio:  50,
+      pressure:      0,
+      impactRatio:   50,
+      signal:        'NEUTRO',
+      signalKey:     'neutral',
+      lastTs:        0,
 
-function connectFuturesWS() {
-  if (!STATE.futSyms.length) return
-  const streams = buildStreams(STATE.futSyms, 'futures')
-  const url     = CFG.FUT_WS + '?streams=' + streams
+      _trades:       [],     // { ts, qty, vol, isBuy, priceDelta }
+    }
+  }
 
-  log(C.dim + '  → WS Futures conectando (' + STATE.futSyms.length + ' streams)...' + C.rst)
-  const ws = new WebSocket(url)
-  STATE.ws.futures = ws
+  // ─────────────────────────────────────────────────────────────
+  // FETCH REST
+  // ─────────────────────────────────────────────────────────────
+  async function fetchTicker(market) {
+    const url = ENDPOINTS[market].rest
+    const res  = await fetch(url)
+    if (!res.ok) throw new Error(`REST ${market} HTTP ${res.status}`)
+    return res.json()
+  }
 
-  ws.on('open',    () => log(C.grn + '  ✓ WS Futures USDT conectado' + C.rst))
-  ws.on('message', raw => {
-    try {
-      const msg  = JSON.parse(raw)
-      const data = msg.data || msg
-      if (data.e === 'aggTrade') processTrade(STATE.futures, data)
-    } catch (_) {}
-  })
-  ws.on('error',   err => log(C.red + '  ✗ WS Futures erro: ' + err.message + C.rst))
-  ws.on('close',   () => {
-    log(C.ylw + '  ↺ WS Futures fechado — reconectando em ' + CFG.RECONNECT_MS/1000 + 's...' + C.rst)
-    setTimeout(connectFuturesWS, CFG.RECONNECT_MS)
-  })
-}
+  async function loadRanking(market) {
+    const opts   = _state.opts
+    const map    = _state.entries[market]
+    const tickers = await fetchTicker(market)
 
-// Fecha e reconecta (após refresh de ranking)
-function reconnectWS() {
-  ;['spot','futures'].forEach(k => {
-    if (STATE.ws[k]) { try { STATE.ws[k].close() } catch (_) {} }
-  })
-  setTimeout(() => { connectSpotWS(); connectFuturesWS() }, 500)
-}
+    // Spot usa USDC, Futures usa USDT
+    const quote = market === 'spot'
+      ? (opts.spotQuote    || 'USDC')
+      : (opts.futuresQuote || 'USDT')
 
-// ─── OUTPUT ──────────────────────────────────────────────────
+    const filtered = tickers
+      .filter(t =>
+        t.symbol.endsWith(quote) &&
+        !opts.excludeKeywords.some(k => t.symbol.includes(k))
+      )
+      .sort((a, b) => +b.quoteVolume - +a.quoteVolume)
+      .slice(0, opts.topN)
 
-function log(...args) { process.stdout.write(args.join(' ') + '\n') }
+    const newSyms = filtered.map(t => t.symbol)
+    _state.symbols[market] = newSyms
 
-function printHeader(label, quote) {
-  const title  = ` ${label} (${quote}) `
-  const border = '═'.repeat(Math.max(0, (106 - title.length) / 2))
-  log('\n' + C.cyn + C.bold + border + title + border + C.rst)
-  log(
-    C.dim +
-    pad('#',   3)          + ' ' +
-    pad('SÍMBOLO',  10, true) + ' ' +
-    pad('PREÇO',     12)     + ' ' +
-    pad('24H%',       7)     + ' ' +
-    pad('VOL 24H',   10)     + ' ' +
-    pad('BUY (sessão)',  13) + ' ' +
-    pad('SELL (sessão)', 13) + ' ' +
-    pad('RATIO',      6)     + ' ' +
-    pad('BARRA',      18, true) + ' ' +
-    pad('1MIN DELTA',  13)   + ' ' +
-    pad('PRESSÃO',    8)     + ' ' +
-    'SINAL' +
-    C.rst
-  )
-  log(C.dim + '─'.repeat(107) + C.rst)
-}
+    filtered.forEach((t, i) => {
+      const rank   = i + 1
+      const exists = map.get(t.symbol)
+      if (exists) {
+        // Actualizar só campos REST sem apagar acumuladores de sessão
+        exists.rank       = rank
+        exists.change24h  = +t.priceChangePercent
+        exists.vol24hBase = +t.volume
+        exists.vol24hQuote= +t.quoteVolume
+        exists.priceHigh  = +t.highPrice
+        exists.priceLow   = +t.lowPrice
+        exists.priceOpen  = +t.openPrice
+      } else {
+        map.set(t.symbol, createEntry(t.symbol, market, rank, t))
+      }
+    })
 
-function printRow(entry, m) {
-  const pChg = entry.price >= entry.prevPrice ? C.grn : C.red
-  const cClr = entry.change24h >= 0 ? C.grn : C.red
-  const pctStr = (entry.change24h >= 0 ? '+' : '') + entry.change24h.toFixed(2) + '%'
+    _log(`[REST] ${market} ranking loaded: ${newSyms.length} symbols`)
+    emit('ranking', { market, symbols: newSyms })
+  }
 
-  // Ratio sessão
-  const totalQuote = entry.buyQuote + entry.sellQuote
-  const buyRatio   = totalQuote > 0 ? (entry.buyQuote / totalQuote * 100) : 50
+  // ─────────────────────────────────────────────────────────────
+  // PROCESSAR MENSAGENS WEBSOCKET
+  // ─────────────────────────────────────────────────────────────
 
-  // Delta janela 1 min
-  const deltaSign  = m.winDelta >= 0 ? C.grn : C.red
-  const deltaStr   = (m.winDelta >= 0 ? '+' : '') + '$' + fmtVol(Math.abs(m.winDelta))
+  /**
+   * aggTrade — trade individual (mais granular)
+   * Campos relevantes:
+   *   s  = symbol
+   *   p  = price           (string)
+   *   q  = quantity        (string)
+   *   m  = isBuyerMaker
+   *        false → comprador foi agressivo (BUY taker)
+   *        true  → vendedor foi agressivo  (SELL taker)
+   *   T  = timestamp ms
+   */
+  function handleAggTrade(market, d) {
+    const map   = _state.entries[market]
+    const entry = map.get(d.s)
+    if (!entry) return
 
-  log(
-    pad(entry.rank, 3)                                             + ' ' +
-    C.wht + C.bold + pad(entry.symbol, 10, true) + C.rst          + ' ' +
-    pChg + pad(fmtPrice(entry.price), 12) + C.rst                 + ' ' +
-    cClr + pad(pctStr, 7) + C.rst                                 + ' ' +
-    C.dim + pad('$' + fmtVol(entry.quoteVol24h), 10) + C.rst     + ' ' +
-    C.grn + pad('$' + fmtVol(entry.buyQuote), 13) + C.rst        + ' ' +
-    C.red + pad('$' + fmtVol(entry.sellQuote), 13) + C.rst       + ' ' +
-    (buyRatio >= 50 ? C.grn : C.red) + pad(buyRatio.toFixed(1) + '%', 6) + C.rst + ' ' +
-    bar(buyRatio, 16) + ' ' +
-    deltaSign + pad(deltaStr, 13) + C.rst                         + ' ' +
-    pressureStr(m.pressure)                                        + ' ' +
-    m.signalColor + m.signal.trim() + C.rst
-  )
-}
+    const price    = +d.p
+    const qty      = +d.q
+    const vol      = price * qty          // volume em USDC (spot) ou USDT (futures)
+    const isBuy    = !d.m                 // false = buyer taker = BUY
+    const ts       = d.T
+    const opts     = _state.opts
 
-function pressureStr(p) {
-  const v   = Math.round(Math.abs(p))
-  const clr = p >= 0 ? C.grn : C.red
-  const sig = p >= 0 ? '+' : '-'
-  return clr + pad(sig + v, 8) + C.rst
-}
+    // Delta de preço desde o último trade conhecido
+    const priceDelta = (entry.price > 0 && entry.lastTs > 0)
+      ? price - entry.price
+      : 0
 
-function printSummary(entries, market) {
-  if (!entries.length) return
-  const totalBuy  = entries.reduce((s, e) => s + e.buyQuote, 0)
-  const totalSell = entries.reduce((s, e) => s + e.sellQuote, 0)
-  const total     = totalBuy + totalSell
-  const ratio     = total > 0 ? totalBuy / total * 100 : 50
-  const dom       = ratio >= 50
-    ? C.grn + 'COMPRADORES DOMINAM  (+' + fmtVol(totalBuy - totalSell) + ' USDC/USDT)' + C.rst
-    : C.red + 'VENDEDORES DOMINAM   (-' + fmtVol(totalSell - totalBuy) + ' USDC/USDT)' + C.rst
-  log(C.dim + '─'.repeat(107) + C.rst)
-  log(
-    C.dim + '  TOTAL ' + market.toUpperCase() + ': ' + C.rst +
-    C.grn + 'Compra $' + fmtVol(totalBuy) + C.rst + ' vs ' +
-    C.red + 'Venda $' + fmtVol(totalSell) + C.rst + '  │  ' +
-    'Ratio: ' + (ratio >= 50 ? C.grn : C.red) + ratio.toFixed(1) + '%' + C.rst + '  │  ' + dom
-  )
-}
+    // ── Actualizar preço ────────────────────────────────────
+    entry.prevPrice = entry.price
+    entry.price     = price
+    entry.lastTs    = ts
 
-function printTopMover(entries, label) {
-  if (!entries.length) return
+    // ── Acumuladores de sessão ──────────────────────────────
+    if (isBuy) {
+      entry.sessionBuyQty += qty
+      entry.sessionBuyVol += vol
+    } else {
+      entry.sessionSellQty += qty
+      entry.sessionSellVol += vol
+    }
+    entry.sessionTrades++
 
-  // maior pressure absoluta
-  const withM = entries.map(e => ({ e, m: computeMetrics(e) }))
-  const top   = withM.reduce((best, cur) =>
-    Math.abs(cur.m.pressure) > Math.abs(best.m.pressure) ? cur : best
-  )
-  // maior delta 1 min
-  const topD  = withM.reduce((best, cur) =>
-    Math.abs(cur.m.winDelta) > Math.abs(best.m.winDelta) ? cur : best
-  )
+    // ── Impacto no preço ────────────────────────────────────
+    // Apenas conta quando o preço se move na direcção do agressor:
+    //   BUY  + preço subiu  → compradores moveram o preço
+    //   SELL + preço caiu   → vendedores moveram o preço
+    const absDelta = Math.abs(priceDelta)
+    if (isBuy  && priceDelta > 0) entry.sessionBuyImpact  += absDelta * vol
+    if (!isBuy && priceDelta < 0) entry.sessionSellImpact += absDelta * vol
 
-  const pressColor = top.m.pressure >= 0 ? C.grn : C.red
-  const dColor     = topD.m.winDelta >= 0 ? C.grn : C.red
+    // ── Trade para janelas deslizantes ──────────────────────
+    const trade = { ts, qty, vol, isBuy, priceDelta }
+    entry._trades.push(trade)
 
-  log(
-    C.ylw + C.bold + '  ⚡ ' + label + ' ' + C.rst +
-    'Maior pressão: ' + C.wht + top.e.symbol + C.rst + ' (' + pressColor + pressureStr(top.m.pressure).trim() + C.rst + ')' +
-    '  │  ' +
-    'Maior delta 1min: ' + C.wht + topD.e.symbol + C.rst + ' (' +
-      dColor + '$' + fmtVol(Math.abs(topD.m.winDelta)) + (topD.m.winDelta >= 0 ? ' compra' : ' venda') + C.rst + ')'
-  )
-}
+    // Purgar trades antigos (além de 5 min)
+    const cutoff5 = ts - opts.windowMs5
+    while (entry._trades.length && entry._trades[0].ts < cutoff5) {
+      entry._trades.shift()
+    }
 
-function printAll() {
-  process.stdout.write('\x1b[2J\x1b[H')   // limpar ecrã
+    // ── Derivados ───────────────────────────────────────────
+    _recompute(entry, ts)
 
-  const now = new Date().toLocaleTimeString('pt-PT')
-  log(C.cyn + C.bold + '\n  BINANCE FLOW MONITOR' + C.rst + C.dim + '  │  ' + now + '  │  Janela deslizante: ' + (CFG.WINDOW_MS/1000) + 's' + C.rst)
+    // ── Emitir evento de tick ───────────────────────────────
+    emit('tick', _snapshot(entry))
+  }
 
-  // ── SPOT ────────────────────────────────────────────────────
-  printHeader('SPOT', 'USDC')
-  const spotEntries = STATE.spotSyms
-    .map(s => STATE.spot.get(s))
-    .filter(Boolean)
+  /**
+   * bookTicker — melhor bid/ask em tempo real
+   * Campos: s, b (bidPrice), B (bidQty), a (askPrice), A (askQty)
+   */
+  function handleBookTicker(market, d) {
+    const entry = _state.entries[market].get(d.s)
+    if (!entry) return
 
-  spotEntries.forEach(entry => {
-    const m = computeMetrics(entry)
-    printRow(entry, m)
-  })
-  printSummary(spotEntries, 'spot')
-  printTopMover(spotEntries, 'SPOT')
+    const bid = +d.b
+    const ask = +d.a
+    entry.bidPrice  = bid
+    entry.askPrice  = ask
+    entry.spread    = ask - bid
+    entry.spreadPct = bid > 0 ? ((ask - bid) / bid) * 100 : 0
+  }
 
-  // ── FUTURES ─────────────────────────────────────────────────
-  printHeader('FUTURES PERP', 'USDT')
-  const futEntries = STATE.futSyms
-    .map(s => STATE.futures.get(s))
-    .filter(Boolean)
+  /**
+   * miniTicker — ticker resumido (actualiza preço e 24h)
+   * Campos: s, c (close/last), o (open), h (high), l (low), v (vol base), q (vol quote)
+   */
+  function handleMiniTicker(market, d) {
+    const entry = _state.entries[market].get(d.s)
+    if (!entry) return
 
-  futEntries.forEach(entry => {
-    const m = computeMetrics(entry)
-    printRow(entry, m)
-  })
-  printSummary(futEntries, 'futures')
-  printTopMover(futEntries, 'FUTURES')
+    entry.prevPrice   = entry.price
+    entry.price       = +d.c
+    entry.priceOpen   = +d.o
+    entry.priceHigh   = +d.h
+    entry.priceLow    = +d.l
+    entry.vol24hBase  = +d.v
+    entry.vol24hQuote = +d.q
 
-  log('\n' + C.dim + '  Próxima actualização em ' + CFG.PRINT_SECS + 's  │  Ctrl+C para sair' + C.rst)
-}
+    const open = +d.o
+    if (open > 0) {
+      entry.change24h = ((+d.c - open) / open) * 100
+    }
+  }
 
-// ─── MÓDULO EXPORT (uso programático) ────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // RECOMPUTAR DERIVADOS
+  // ─────────────────────────────────────────────────────────────
+  function _recompute(entry, nowTs) {
+    const opts = _state.opts
+    const cut1 = nowTs - opts.windowMs
+    const cut5 = nowTs - opts.windowMs5
 
-/**
- * Acesso aos dados em bruto para integração noutros módulos.
- * Exemplo:
- *   const bf = require('./binance-flow')
- *   await bf.start()
- *   setInterval(() => {
- *     const snap = bf.snapshot()
- *     console.log(snap.spot[0])   // { symbol, buyQuote, sellQuote, buyRatio, pressure, signal, ... }
- *   }, 5000)
- */
-function snapshot() {
-  const mapEntries = (syms, map) =>
-    syms
+    // Somar janelas
+    let b1v=0, s1v=0, b1i=0, s1i=0, t1=0
+    let b5v=0, s5v=0, t5=0
+
+    for (const tr of entry._trades) {
+      const in5 = tr.ts >= cut5
+      const in1 = tr.ts >= cut1
+
+      if (in5) {
+        if (tr.isBuy) b5v += tr.vol; else s5v += tr.vol
+        t5++
+      }
+      if (in1) {
+        if (tr.isBuy) { b1v += tr.vol; if (tr.priceDelta > 0) b1i += Math.abs(tr.priceDelta) * tr.vol }
+        else           { s1v += tr.vol; if (tr.priceDelta < 0) s1i += Math.abs(tr.priceDelta) * tr.vol }
+        t1++
+      }
+    }
+
+    entry.win1BuyVol    = b1v
+    entry.win1SellVol   = s1v
+    entry.win1Delta     = b1v - s1v
+    entry.win1BuyImpact = b1i
+    entry.win1SellImpact= s1i
+    entry.win1Trades    = t1
+
+    entry.win5BuyVol    = b5v
+    entry.win5SellVol   = s5v
+    entry.win5Delta     = b5v - s5v
+    entry.win5Trades    = t5
+
+    // Ratios
+    const totSess = entry.sessionBuyVol + entry.sessionSellVol
+    const tot1    = b1v + s1v
+    const tot5    = b5v + s5v
+
+    entry.buyRatio     = totSess > 0 ? (entry.sessionBuyVol / totSess) * 100 : 50
+    entry.win1BuyRatio = tot1    > 0 ? (b1v / tot1) * 100 : 50
+    entry.win5BuyRatio = tot5    > 0 ? (b5v / tot5) * 100 : 50
+
+    // Pressão combinada: peso maior para janela recente
+    // Resultado: -100 (venda extrema) a +100 (compra extrema)
+    const p1 = (entry.win1BuyRatio - 50) * 2   // -100..+100
+    const p5 = (entry.win5BuyRatio - 50) * 2
+    const ps = (entry.buyRatio      - 50) * 2
+    entry.pressure = p1 * 0.50 + p5 * 0.30 + ps * 0.20
+
+    // Impacto no preço
+    const totImpact = entry.sessionBuyImpact + entry.sessionSellImpact
+    entry.impactRatio = totImpact > 0
+      ? (entry.sessionBuyImpact / totImpact) * 100
+      : 50
+
+    // Sinal
+    const pr = entry.pressure
+    if      (pr >=  70) { entry.signalKey = 'extreme_buy';   entry.signal = '🔥🔥 COMPRA EXTREMA'  }
+    else if (pr >=  35) { entry.signalKey = 'strong_buy';    entry.signal = '🔥 COMPRA FORTE'      }
+    else if (pr >=  10) { entry.signalKey = 'buy';           entry.signal = '↑ COMPRADORES'        }
+    else if (pr >=  -10){ entry.signalKey = 'neutral';       entry.signal = '⚖ NEUTRO'             }
+    else if (pr >= -35) { entry.signalKey = 'sell';          entry.signal = '↓ VENDEDORES'         }
+    else if (pr >= -70) { entry.signalKey = 'strong_sell';   entry.signal = '📉 VENDA FORTE'       }
+    else                 { entry.signalKey = 'extreme_sell';  entry.signal = '💀 VENDA EXTREMA'    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // SNAPSHOT — cópia limpa de uma entry para emitir
+  // ─────────────────────────────────────────────────────────────
+  function _snapshot(entry) {
+    const { _trades, ...clean } = entry   // remover array interno
+    return Object.freeze({ ...clean })
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // WEBSOCKET — GESTÃO DE CONEXÕES
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * Abre uma conexão de stream combinado.
+   * @param {string} market  'spot' | 'futures'
+   * @param {string} type    'trade' | 'book' | 'mini'
+   * @param {string[]} syms  lista de símbolos
+   */
+  function openStream(market, type, syms) {
+    if (!syms.length) return
+
+    const key = `${market}:${type}`
+    const existing = _state.sockets.get(key)
+    if (existing) {
+      existing._closing = true
+      try { existing.ws.close() } catch(_) {}
+    }
+
+    const streamNames = syms.map(s => {
+      const sl = s.toLowerCase()
+      if (type === 'trade') return sl + '@aggTrade'
+      if (type === 'book')  return sl + '@bookTicker'
+      if (type === 'mini')  return sl + '@miniTicker'
+    })
+
+    const url = ENDPOINTS[market].streamBase + '?streams=' + streamNames.join('/')
+    const conn = { ws: null, _closing: false, reconnects: 0 }
+    _state.sockets.set(key, conn)
+
+    function connect() {
+      _log(`[WS] open ${key} (${syms.length} streams)`)
+      const ws = new WS(url)
+      conn.ws  = ws
+
+      ws.onopen = () => {
+        _log(`[WS] connected ${key}`)
+        conn.reconnects = 0
+        emit('status', { market, type, status: 'connected', key })
+        _checkAllConnected()
+      }
+
+      ws.onmessage = e => {
+        let msg
+        try { msg = JSON.parse(typeof e.data === 'string' ? e.data : e.data.toString()) }
+        catch { return }
+
+        // Combined stream: { stream, data }
+        const data = msg.data || msg
+
+        if (!data || !data.e) return
+        switch (data.e) {
+          case 'aggTrade':  handleAggTrade(market, data);   break
+          case 'bookTicker': handleBookTicker(market, data); break
+          case '24hrMiniTicker': handleMiniTicker(market, data); break
+        }
+      }
+
+      ws.onerror = err => {
+        _log(`[WS] error ${key}:`, err?.message || err)
+        emit('status', { market, type, status: 'error', key })
+      }
+
+      ws.onclose = () => {
+        if (conn._closing) return
+        const delay = _state.opts.reconnectMs
+        const maxR  = _state.opts.maxReconnects
+        if (maxR > 0 && conn.reconnects >= maxR) {
+          _log(`[WS] max reconnects reached ${key}`)
+          emit('status', { market, type, status: 'failed', key })
+          return
+        }
+        conn.reconnects++
+        _log(`[WS] closed ${key} — reconnect #${conn.reconnects} in ${delay}ms`)
+        emit('status', { market, type, status: 'reconnecting', key, attempt: conn.reconnects })
+        setTimeout(connect, delay)
+      }
+    }
+
+    connect()
+  }
+
+  function _checkAllConnected() {
+    const all = [..._state.sockets.values()]
+    const allOpen = all.length > 0 && all.every(c => c.ws?.readyState === 1)
+    if (allOpen) emit('ready', _getAllData())
+  }
+
+  function _openStreamsForMarket(market) {
+    const syms = _state.symbols[market]
+    openStream(market, 'trade', syms)   // aggTrade — principal (buy/sell)
+    openStream(market, 'book',  syms)   // bookTicker — spread
+    openStream(market, 'mini',  syms)   // miniTicker — preço/24h
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // EVENTOS (pub/sub simples)
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * Eventos disponíveis:
+   *   'ready'    — emitido quando todos os WS estão conectados. Payload: snapshot completo
+   *   'tick'     — emitido a cada aggTrade. Payload: Entry snapshot
+   *   'update'   — emitido a cada 1s com snapshot de todos os símbolos
+   *   'ranking'  — emitido quando o ranking é (re)carregado via REST
+   *   'status'   — mudanças de estado das conexões WS
+   */
+  function on(event, fn) {
+    if (!_state.listeners.has(event)) _state.listeners.set(event, new Set())
+    _state.listeners.get(event).add(fn)
+    return () => off(event, fn)   // retorna função para remover listener
+  }
+
+  function off(event, fn) {
+    _state.listeners.get(event)?.delete(fn)
+  }
+
+  function emit(event, data) {
+    const listeners = _state.listeners.get(event)
+    if (!listeners?.size) return
+    listeners.forEach(fn => {
+      try { fn(data) }
+      catch (err) { console.error(`[BinanceWS] listener error (${event}):`, err) }
+    })
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // API PÚBLICA — DADOS
+  // ─────────────────────────────────────────────────────────────
+
+  /** Retorna snapshot de todos os símbolos de um mercado */
+  function getMarket(market) {
+    const syms = _state.symbols[market]
+    const map  = _state.entries[market]
+    return syms
       .map(s => map.get(s))
       .filter(Boolean)
-      .map(entry => {
-        const m = computeMetrics(entry)
-        return {
-          symbol     : entry.symbol,
-          market     : entry.market,
-          rank       : entry.rank,
-          price      : entry.price,
-          change24h  : entry.change24h,
-          quoteVol24h: entry.quoteVol24h,
-          buyQuote   : entry.buyQuote,
-          sellQuote  : entry.sellQuote,
-          buyQty     : entry.buyQty,
-          sellQty    : entry.sellQty,
-          tradeCount : entry.tradeCount,
-          buyRatio   : m.buyRatio,
-          winBuyRatio: m.winBuyRatio,
-          winDelta   : m.winDelta,
-          pressure   : m.pressure,
-          signal     : m.signal.trim(),
-          lastTrade  : entry.lastTrade,
-        }
-      })
-
-  return {
-    spot   : mapEntries(STATE.spotSyms, STATE.spot),
-    futures: mapEntries(STATE.futSyms,  STATE.futures),
-    ts     : Date.now(),
-  }
-}
-
-// ─── INÍCIO ──────────────────────────────────────────────────
-
-async function start() {
-  if (STATE.running) return
-  STATE.running = true
-
-  log(C.cyn + C.bold + '\n  ═══════════════════════════════════' + C.rst)
-  log(C.cyn + C.bold + '  BINANCE FLOW MONITOR — iniciando...' + C.rst)
-  log(C.cyn + C.bold + '  ═══════════════════════════════════\n' + C.rst)
-
-  // 1. Carga inicial
-  try {
-    await fetchTopSpotUSDC()
-    await fetchTopFuturesUSDT()
-  } catch (err) {
-    log(C.red + '  ✗ Erro na carga REST: ' + err.message + C.rst)
-    process.exit(1)
+      .map(_snapshot)
   }
 
-  // 2. Conectar WebSockets
-  connectSpotWS()
-  connectFuturesWS()
+  /** Retorna snapshot de um símbolo específico */
+  function getSymbol(symbol, market = 'spot') {
+    const entry = _state.entries[market].get(symbol)
+    return entry ? _snapshot(entry) : null
+  }
 
-  // 3. Output periódico
-  setTimeout(() => {
-    printAll()
-    setInterval(printAll, CFG.PRINT_SECS * 1000)
-  }, 2000)
-
-  // 4. Refresh periódico do ranking (mantém top 25 actualizado)
-  setInterval(async () => {
-    log(C.dim + '\n  [refresh] a actualizar ranking de volume...' + C.rst)
-    try {
-      await fetchTopSpotUSDC()
-      await fetchTopFuturesUSDT()
-      reconnectWS()
-    } catch (err) {
-      log(C.red + '  ✗ Erro no refresh: ' + err.message + C.rst)
+  /** Retorna snapshot completo de todos os mercados */
+  function _getAllData() {
+    return {
+      spot:    getMarket('spot'),
+      futures: getMarket('futures'),
+      ts:      Date.now(),
     }
-  }, CFG.REFRESH_SECS * 1000)
-}
+  }
 
-// ─── GRACEFUL SHUTDOWN ───────────────────────────────────────
+  /**
+   * Retorna métricas agregadas de um mercado
+   * (totais, quem domina, top movers, etc.)
+   */
+  function getMarketSummary(market) {
+    const entries = getMarket(market)
+    if (!entries.length) return null
 
-process.on('SIGINT', () => {
-  log('\n\n' + C.ylw + '  Encerrando...' + C.rst)
-  ;['spot','futures'].forEach(k => {
-    if (STATE.ws[k]) try { STATE.ws[k].close() } catch (_) {}
-  })
-  process.exit(0)
-})
+    let totalBuyVol = 0, totalSellVol = 0
+    let totalBuyImpact = 0, totalSellImpact = 0
+    let totalWin1Buy = 0, totalWin1Sell = 0
 
-// ─── ENTRADA ─────────────────────────────────────────────────
+    entries.forEach(e => {
+      totalBuyVol    += e.sessionBuyVol
+      totalSellVol   += e.sessionSellVol
+      totalBuyImpact += e.sessionBuyImpact
+      totalSellImpact+= e.sessionSellImpact
+      totalWin1Buy   += e.win1BuyVol
+      totalWin1Sell  += e.win1SellVol
+    })
 
-// Execução directa: node binance-flow.js
-if (require.main === module) {
-  start().catch(err => {
-    log(C.red + '  Erro fatal: ' + err.message + C.rst)
-    process.exit(1)
-  })
-}
+    const totalVol    = totalBuyVol + totalSellVol
+    const totalImpact = totalBuyImpact + totalSellImpact
+    const totalWin1   = totalWin1Buy + totalWin1Sell
 
-module.exports = { start, snapshot, STATE, CFG }
+    const buyRatio    = totalVol    > 0 ? totalBuyVol    / totalVol    * 100 : 50
+    const impactRatio = totalImpact > 0 ? totalBuyImpact / totalImpact * 100 : 50
+    const win1Ratio   = totalWin1   > 0 ? totalWin1Buy   / totalWin1   * 100 : 50
+
+    // Top movers — maior delta absoluto na janela 1 min
+    const sorted = [...entries].sort((a, b) => Math.abs(b.win1Delta) - Math.abs(a.win1Delta))
+    const topMoverBuy  = sorted.find(e => e.win1Delta > 0) || sorted[0]
+    const topMoverSell = sorted.find(e => e.win1Delta < 0) || sorted[sorted.length - 1]
+
+    // Maior pressão
+    const highestPressure = [...entries].sort((a, b) => b.pressure - a.pressure)[0]
+    const lowestPressure  = [...entries].sort((a, b) => a.pressure - b.pressure)[0]
+
+    return {
+      market,
+      totalBuyVol,
+      totalSellVol,
+      totalVol,
+      buyRatio,          // % de compra — sessão
+      win1Ratio,         // % de compra — último minuto
+      impactRatio,       // % de impacto dos compradores no preço
+      dominantSide:      buyRatio >= 50 ? 'buy' : 'sell',
+      priceMover:        impactRatio >= 50 ? 'buyers' : 'sellers',
+      delta:             totalBuyVol - totalSellVol,
+      win1Delta:         totalWin1Buy - totalWin1Sell,
+      topMoverBuy,
+      topMoverSell,
+      highestPressure,
+      lowestPressure,
+      ts: Date.now(),
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // START / STOP
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * Inicia a recolha de dados.
+   * @param {Object} [options]
+   * @param {number}   [options.topN=25]
+   * @param {string[]} [options.markets=['spot','futures']]
+   * @param {string}   [options.spotQuote='USDC']      quote asset para spot
+   * @param {string}   [options.futuresQuote='USDT']   quote asset para futures
+   * @param {number}   [options.windowMs=60000]
+   * @param {number}   [options.windowMs5=300000]
+   * @param {number}   [options.refreshMs=30000]
+   * @param {number}   [options.reconnectMs=3000]
+   * @param {number}   [options.maxReconnects=0]
+   * @param {string[]} [options.excludeKeywords]
+   * @param {boolean}  [options.debug=false]
+   * @returns {Promise<void>}
+   */
+  async function start(options = {}) {
+    if (_state.running) {
+      console.warn('[BinanceWS] já está a correr. Chama stop() primeiro.')
+      return
+    }
+
+    _state.opts    = { ...DEFAULTS, ...options }
+    _state.running = true
+
+    _log('[BinanceWS] a iniciar...', _state.opts)
+
+    // 1. Carregar rankings via REST
+    const markets = _state.opts.markets
+    try {
+      await Promise.all(markets.map(loadRanking))
+    } catch (err) {
+      console.error('[BinanceWS] erro REST:', err)
+      throw err
+    }
+
+    // 2. Abrir streams WS
+    markets.forEach(_openStreamsForMarket)
+
+    // 3. Emitir update periódico (snapshot completo a cada segundo)
+    const updateTimer = setInterval(() => {
+      emit('update', _getAllData())
+    }, 1000)
+
+    // 4. Refresh periódico do ranking REST
+    _state.refreshTimer = setInterval(async () => {
+      _log('[REST] a actualizar rankings...')
+      try {
+        await Promise.all(markets.map(async market => {
+          const oldSyms = _state.symbols[market].join()
+          await loadRanking(market)
+          const newSyms = _state.symbols[market].join()
+          if (oldSyms !== newSyms) {
+            _log(`[REST] ${market} ranking mudou — a reconectar streams`)
+            _openStreamsForMarket(market)
+          }
+        }))
+      } catch (err) {
+        _log('[REST] erro no refresh:', err.message)
+      }
+    }, _state.opts.refreshMs)
+
+    // Guardar timer para cleanup
+    _state._updateTimer = updateTimer
+
+    _log('[BinanceWS] iniciado ✓')
+  }
+
+  /**
+   * Para todos os streams e limpa o estado.
+   */
+  function stop() {
+    _log('[BinanceWS] a parar...')
+    _state.running = false
+
+    clearInterval(_state.refreshTimer)
+    clearInterval(_state._updateTimer)
+
+    _state.sockets.forEach((conn, key) => {
+      _log(`[WS] closing ${key}`)
+      conn._closing = true
+      try { conn.ws?.close() } catch(_) {}
+    })
+    _state.sockets.clear()
+
+    _log('[BinanceWS] parado ✓')
+    emit('status', { status: 'stopped' })
+  }
+
+  /**
+   * Para e reinicia do zero (mantém listeners).
+   */
+  async function restart(options) {
+    stop()
+    await new Promise(r => setTimeout(r, 500))
+    _state.running   = false
+    _state.entries   = { spot: new Map(), futures: new Map() }
+    _state.symbols   = { spot: [], futures: [] }
+    await start(options || _state.opts)
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // UTILITÁRIOS
+  // ─────────────────────────────────────────────────────────────
+
+  function _log(...args) {
+    if (_state.opts?.debug) console.log('[BinanceWS]', ...args)
+  }
+
+  /** Formata volume em K/M/B */
+  function fmtVol(n) {
+    if (n == null || isNaN(n)) return '—'
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+    return n.toFixed(2)
+  }
+
+  /** Formata preço com precisão adaptativa */
+  function fmtPrice(n) {
+    if (!n) return '—'
+    if (n >= 10000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 })
+    if (n >= 100)   return n.toFixed(3)
+    if (n >= 1)     return n.toFixed(4)
+    if (n >= 0.01)  return n.toFixed(5)
+    return n.toFixed(6)
+  }
+
+  /** Retorna pressão formatada como string */
+  function fmtPressure(pressure) {
+    const sign = pressure >= 0 ? '+' : ''
+    return sign + pressure.toFixed(1)
+  }
+
+  /** Estado das conexões WS */
+  function getConnectionStatus() {
+    const status = {}
+    _state.sockets.forEach((conn, key) => {
+      const rs = conn.ws?.readyState
+      status[key] = rs === 0 ? 'CONNECTING'
+                  : rs === 1 ? 'OPEN'
+                  : rs === 2 ? 'CLOSING'
+                  : rs === 3 ? 'CLOSED'
+                  : 'UNKNOWN'
+    })
+    return status
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // API PÚBLICA
+  // ─────────────────────────────────────────────────────────────
+  return {
+    // lifecycle
+    start,
+    stop,
+    restart,
+
+    // eventos
+    on,
+    off,
+
+    // dados
+    getMarket,
+    getSymbol,
+    getMarketSummary,
+    getAllData: _getAllData,
+
+    // utilitários
+    fmtVol,
+    fmtPrice,
+    fmtPressure,
+    getConnectionStatus,
+
+    // acesso ao estado (só leitura)
+    get symbols()  { return { spot: [..._state.symbols.spot],    futures: [..._state.symbols.futures] } },
+    get running()  { return _state.running },
+    get version()  { return '1.0.0' },
+  }
+
+})) // fim UMD
