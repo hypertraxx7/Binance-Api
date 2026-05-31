@@ -1,785 +1,1056 @@
 /**
- * binance-v2.js  v4.0.0
- * ═══════════════════════════════════════════════════════════════
- * Módulo de dados em tempo real — Binance WebSocket
- *
- * ┌─────────────────────────────────────────────────────────────┐
- * │  MERCADO         ENDPOINT WebSocket                        │
- * ├─────────────────────────────────────────────────────────────┤
- * │  Spot USDC       wss://stream.binance.com:9443/stream      │
- * │  Fut (public)    wss://fstream.binance.com/public/stream   │
- * │  Fut (markPrice) wss://fstream.binance.com/market/stream   │
- * │  Fut (WS API)    wss://ws-fapi.binance.com/ws-fapi/v1      │
- * └─────────────────────────────────────────────────────────────┘
- *
- * Streams subscritos:
- * ───────────────────────────────────────────────────────────────
- * Spot    : <sym>@aggTrade  <sym>@miniTicker
- * Fut pub : <sym>@aggTrade  <sym>@miniTicker
- * Fut mkt : <sym>@markPrice@1s
- *           (requer rota /market — não funciona em /stream genérico)
- *
- * USDⓈ-M WebSocket API (wss://ws-fapi.binance.com/ws-fapi/v1):
- *   Protocolo request/response (como REST mas sobre WS).
- *   Usado para: depth snapshots sob pedido.
- *   Formato envio  : { "id": "uid", "method": "depth", "params": { "symbol", "limit" } }
- *   Formato resposta: { "id": "uid", "status": 200, "result": { "bids", "asks", "lastUpdateId" } }
- *
- * SIGNAL LOGIC (STICKY):
- *   O sinal apenas muda quando a pressão cruza os limiares extremos:
- *     pressure >= +72 → 'extreme_buy'  (🔥 COMPRA MAX)
- *     pressure <= -72 → 'extreme_sell' (💀 VENDA MAX)
- *   Entre extremos: o sinal fica no último estado extreme.
- *
- * EVENTOS:
- *   'ready'    — todos os WS conectados. payload: snapshot
- *   'tick'     — aggTrade processado. payload: Entry
- *   'extreme'  — sinal mudou para extremo. payload: Entry
- *   'mark'     — markPriceUpdate. payload: Entry
- *   'book'     — order book actualizado. payload: BookData
- *   'update'   — snapshot periódico 1s. payload: { spot[], futures[] }
- *   'ranking'  — ranking REST recarregado. payload: { mkt, symbols }
- *   'status'   — estado de conexão WS. payload: { id, status }
- *
- * USO (Browser):
- *   <script src="binance-v2.js"></script>
- *   <script>
- *     await BinanceV2.start({ topN: 25 })
- *     BinanceV2.on('update',  snap => render(snap))
- *     BinanceV2.on('extreme', entry => alert(entry.sym + ': ' + entry.sigTxt))
- *     BinanceV2.on('book',    book => renderBook(book))
- *     BinanceV2.subscribeBook('BTCUSDT', 'futures', 10)
- *   </script>
- *
- * USO (Node.js):
- *   npm install ws node-fetch
- *   const B = require('./binance-v2')
- *   await B.start({ topN: 25, debug: true })
- *   B.on('update', s => console.log(B.getSummary('futures')))
- * ═══════════════════════════════════════════════════════════════
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  script.js — Binance WebSocket Real-Time Price Updater          ║
+ * ║  Versão: 1.0.0                                                  ║
+ * ╠══════════════════════════════════════════════════════════════════╣
+ * ║  Subscreve streams da Binance e actualiza preços em tempo real  ║
+ * ║  Compatível com: Browser (ES Module + UMD) e Node.js            ║
+ * ╠══════════════════════════════════════════════════════════════════╣
+ * ║  STREAMS SUPORTADOS                                             ║
+ * ║  ─────────────────────────────────────────────────────────────  ║
+ * ║  miniTicker   — preço, variação 24h, volume (menor overhead)    ║
+ * ║  bookTicker   — melhor bid/ask em tempo real                    ║
+ * ║  aggTrade     — cada trade individual (buy/sell taker)          ║
+ * ║  ticker       — ticker completo 24h                             ║
+ * ║  kline        — velas OHLCV por timeframe                       ║
+ * ║  depth        — order book parcial (5/10/20 níveis)            ║
+ * ╠══════════════════════════════════════════════════════════════════╣
+ * ║  USO BÁSICO (Browser)                                           ║
+ * ║  ─────────────────────────────────────────────────────────────  ║
+ * ║  <script src="script.js"></script>                              ║
+ * ║  <script>                                                       ║
+ * ║    const tracker = BinancePrice.create()                        ║
+ * ║    await tracker.start(['BTCUSDT', 'ETHUSDT'])                  ║
+ * ║    tracker.on('price', ({ symbol, price, change }) => {         ║
+ * ║      document.getElementById('btc').textContent = price         ║
+ * ║    })                                                           ║
+ * ║  </script>                                                      ║
+ * ╠══════════════════════════════════════════════════════════════════╣
+ * ║  USO BÁSICO (Node.js)                                           ║
+ * ║  ─────────────────────────────────────────────────────────────  ║
+ * ║  npm install ws node-fetch                                      ║
+ * ║  const { create } = require('./script')                         ║
+ * ║  const tracker = create()                                       ║
+ * ║  await tracker.start(['BTCUSDT', 'ETHUSDT'])                    ║
+ * ║  tracker.on('price', d => console.log(d.symbol, d.price))       ║
+ * ╠══════════════════════════════════════════════════════════════════╣
+ * ║  EVENTOS                                                        ║
+ * ║  ─────────────────────────────────────────────────────────────  ║
+ * ║  'price'      — preço actualizado (miniTicker + bookTicker)     ║
+ * ║  'trade'      — trade individual (aggTrade)                     ║
+ * ║  'ticker'     — ticker completo 24h                             ║
+ * ║  'kline'      — vela actualizada                                ║
+ * ║  'depth'      — order book actualizado                          ║
+ * ║  'connect'    — stream conectado                                ║
+ * ║  'disconnect' — stream desconectado                             ║
+ * ║  'error'      — erro de conexão                                 ║
+ * ║  'status'     — mudança de estado geral                         ║
+ * ╚══════════════════════════════════════════════════════════════════╝
  */
 
 ;(function (root, factory) {
+  /* UMD — funciona em Node.js (CommonJS), browser (global) e bundlers (AMD) */
   if (typeof module !== 'undefined' && module.exports) {
-    const WS = typeof WebSocket !== 'undefined' ? WebSocket
-      : (() => { try { return require('ws') } catch (_) { throw new Error('npm install ws') } })()
-    const ft = typeof fetch !== 'undefined' ? fetch.bind(globalThis)
-      : (() => { try { return require('node-fetch') } catch (_) { throw new Error('npm install node-fetch') } })()
-    module.exports = factory(WS, ft)
+    /* Node.js */
+    const WSImpl = (function () {
+      if (typeof WebSocket !== 'undefined') return WebSocket
+      try { return require('ws') }
+      catch (_) { throw new Error('[BinancePrice] Node.js: npm install ws') }
+    })()
+    const fetchImpl = (function () {
+      if (typeof fetch !== 'undefined') return fetch.bind(globalThis)
+      try { return require('node-fetch') }
+      catch (_) { throw new Error('[BinancePrice] Node.js: npm install node-fetch') }
+    })()
+    module.exports = factory(WSImpl, fetchImpl)
+  } else if (typeof define === 'function' && define.amd) {
+    /* AMD */
+    define([], () => factory(WebSocket, fetch.bind(window)))
   } else {
-    root.BinanceV2 = factory(WebSocket, fetch.bind(window))
+    /* Browser global */
+    root.BinancePrice = factory(WebSocket, fetch.bind(window))
   }
 }(typeof globalThis !== 'undefined' ? globalThis : this, function (WSImpl, fetchFn) {
   'use strict'
 
-  // ─── ENDPOINTS ──────────────────────────────────────────────
+  /* ════════════════════════════════════════════════════════════════
+     ENDPOINTS
+  ════════════════════════════════════════════════════════════════ */
 
-  const EP = {
+  const ENDPOINTS = {
     spot: {
-      rest:    'https://api.binance.com/api/v3/ticker/24hr',
-      depth:   'https://api.binance.com/api/v3/depth',
-      wsBase:  'wss://stream.binance.com:9443/stream',
+      rest: 'https://api.binance.com/api/v3',
+      ws:   'wss://stream.binance.com:9443/stream',
     },
     futures: {
-      rest:    'https://fapi.binance.com/fapi/v1/ticker/24hr',
-      exch:    'https://fapi.binance.com/fapi/v1/exchangeInfo',
-      depth:   'https://fapi.binance.com/fapi/v1/depth',
-      wsPub:   'wss://fstream.binance.com/public/stream',   // aggTrade, miniTicker, depth
-      wsMkt:   'wss://fstream.binance.com/market/stream',   // markPrice
-      wsApi:   'wss://ws-fapi.binance.com/ws-fapi/v1',      // request/response API
+      rest: 'https://fapi.binance.com/fapi/v1',
+      ws:   'wss://fstream.binance.com/stream',
+    },
+    coin: {
+      rest: 'https://dapi.binance.com/dapi/v1',
+      ws:   'wss://dstream.binance.com/stream',
     },
   }
 
-  // ─── DEFAULTS ───────────────────────────────────────────────
+  /* ════════════════════════════════════════════════════════════════
+     DEFAULTS
+  ════════════════════════════════════════════════════════════════ */
 
   const DEFAULTS = {
-    topN:          25,
-    spotQuote:     'USDC',
-    futuresQuote:  'USDT',
-    window1Ms:     60_000,    // janela deslizante 1 min
-    window5Ms:     300_000,   // janela deslizante 5 min
-    refreshMs:     30_000,    // re-rank REST
-    reconnectMs:   3_500,
-    updateHz:      1_000,     // evento 'update' periódico
-    maxPerConn:    400,       // max streams por conexão WS
-    excludeKw:     ['UP','DOWN','BULL','BEAR','3L','3S','LEVERAGE','HEDGE'],
-    debug:         false,
+    /** Mercado: 'spot' | 'futures' | 'coin' */
+    market: 'spot',
+
+    /**
+     * Tipo de stream principal para preços.
+     * 'mini'  → miniTicker  (menor overhead, recomendado)
+     * 'book'  → bookTicker  (bid/ask em tempo real)
+     * 'full'  → ticker 24h completo
+     * 'both'  → miniTicker + bookTicker em simultâneo
+     */
+    priceStream: 'mini',
+
+    /** Número máximo de streams por conexão WebSocket (limite Binance: 1024) */
+    maxStreamsPerConn: 300,
+
+    /** Reconectar automaticamente após perda de conexão */
+    autoReconnect: true,
+
+    /** Atraso base de reconexão em ms (aumenta com backoff exponencial) */
+    reconnectDelay: 3_000,
+
+    /** Máximo de tentativas de reconexão (0 = ilimitado) */
+    maxReconnects: 0,
+
+    /** Intervalo de ping manual ao servidor WS em ms (< 3 min para evitar timeout) */
+    pingInterval: 150_000,
+
+    /** Activar logs de debug */
+    debug: false,
   }
 
-  // ─── ESTADO ─────────────────────────────────────────────────
+  /* ════════════════════════════════════════════════════════════════
+     CRIA INSTÂNCIA
+  ════════════════════════════════════════════════════════════════ */
 
-  const S = {
-    opts:      null,
-    perps:     new Set(),
-    symbols:   { spot: [], futures: [] },
-    entries:   { spot: new Map(), futures: new Map() },
-    conns:     {
-      spot:    null,   // aggTrade + miniTicker
-      futPub:  null,   // aggTrade + miniTicker
-      futMkt:  null,   // markPrice
-      futApi:  null,   // WS API (depth)
-      obSpot:  null,   // spot depth stream
-    },
-    book: {
-      sym:        null,
-      mkt:        null,
-      depth:      5,
-      apiSeq:     0,
-      apiPending: new Map(),
-      pollTimer:  null,
-    },
-    listeners: new Map(),
-    running:   false,
-    timers:    [],
-  }
-
-  // ─── ENTRY ──────────────────────────────────────────────────
   /**
-   * @typedef {Object} Entry
-   * @property {string}  sym              símbolo
-   * @property {string}  mkt              'spot' | 'futures'
-   * @property {number}  rank
-   * @property {number}  price
-   * @property {number}  prevPrice
-   * @property {number}  markPrice        futures only
-   * @property {number}  fundingRate      futures only (decimal)
-   * @property {number}  msToFunding      futures only
-   * @property {number}  change24h        % 24h
-   * @property {number}  vol24h           volume 24h (USDC/USDT)
+   * Cria uma nova instância do tracker de preços.
    *
-   * — Sessão —
-   * @property {number}  sessBuy          vol comprador acumulado
-   * @property {number}  sessSell         vol vendedor acumulado
-   * @property {number}  sessCount        total trades
-   * @property {number}  sessBuyImpact    impacto comprador no preço
-   * @property {number}  sessSellImpact   impacto vendedor no preço
-   *
-   * — Janela 1 min —
-   * @property {number}  w1Buy
-   * @property {number}  w1Sell
-   * @property {number}  w1Delta          buy - sell
-   *
-   * — Janela 5 min —
-   * @property {number}  w5Buy
-   * @property {number}  w5Sell
-   *
-   * — Derivados —
-   * @property {number}  sessRatio        % buy sessão
-   * @property {number}  w1Ratio          % buy 1min
-   * @property {number}  w5Ratio          % buy 5min
-   * @property {number}  pressure         −100…+100
-   * @property {number}  impactRatio      % impacto compradores
-   *
-   * — Sinal sticky (só muda em extreme) —
-   * @property {string}  sigKey           'extreme_buy' | 'extreme_sell' | 'off'
-   * @property {string}  sigTxt           texto do sinal
+   * @param {object} [opts] — opções (ver DEFAULTS acima)
+   * @returns {PriceTracker}
    */
-  function mkEntry(sym, mkt, rank, t) {
-    return {
-      sym, mkt, rank,
-      price: +t.lastPrice, prevPrice: +t.lastPrice,
-      markPrice: 0, fundingRate: 0, msToFunding: 0,
-      change24h: +t.priceChangePercent, vol24h: +t.quoteVolume,
-      sessBuy: 0, sessSell: 0, sessCount: 0,
-      sessBuyImpact: 0, sessSellImpact: 0,
-      w1Buy: 0, w1Sell: 0, w1Delta: 0, w1BI: 0, w1SI: 0,
-      w5Buy: 0, w5Sell: 0,
-      sessRatio: 50, w1Ratio: 50, w5Ratio: 50,
-      pressure: 0, impactRatio: 50,
-      sigKey: 'off', sigTxt: '—',   // STICKY — only updates on extreme
-      lastTs: 0, _trades: [],
+  function create (opts) {
+    return new PriceTracker(opts)
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     PRICE TRACKER CLASS
+  ════════════════════════════════════════════════════════════════ */
+
+  /**
+   * @typedef {object} PriceData
+   * Dados emitidos no evento 'price':
+   * @property {string}  symbol       — símbolo (ex: 'BTCUSDT')
+   * @property {number}  price        — preço actual
+   * @property {number}  prevPrice    — preço anterior
+   * @property {number}  open         — abertura 24h
+   * @property {number}  high         — máximo 24h
+   * @property {number}  low          — mínimo 24h
+   * @property {number}  change       — variação absoluta 24h
+   * @property {number}  changePct    — variação % 24h
+   * @property {number}  volume       — volume 24h (base asset)
+   * @property {number}  quoteVolume  — volume 24h (quote asset)
+   * @property {number}  bidPrice     — melhor bid (se stream 'book' activo)
+   * @property {number}  bidQty       — quantidade bid
+   * @property {number}  askPrice     — melhor ask
+   * @property {number}  askQty       — quantidade ask
+   * @property {number}  spread       — ask − bid
+   * @property {number}  spreadPct    — spread em %
+   * @property {number}  lastTs       — timestamp em ms
+   * @property {string}  market       — 'spot' | 'futures' | 'coin'
+   */
+
+  /**
+   * @typedef {object} TradeData
+   * Dados emitidos no evento 'trade':
+   * @property {string}  symbol       — símbolo
+   * @property {number}  price        — preço do trade
+   * @property {number}  qty          — quantidade
+   * @property {number}  quoteQty     — quantidade em quote (price * qty)
+   * @property {boolean} isBuy        — true = comprador foi agressivo (taker buy)
+   * @property {number}  ts           — timestamp ms
+   * @property {string}  tradeId      — ID do trade agregado
+   */
+
+  /**
+   * @typedef {object} KlineData
+   * Dados emitidos no evento 'kline':
+   * @property {string}  symbol
+   * @property {string}  interval     — '1m' | '5m' | '1h' | etc.
+   * @property {number}  open
+   * @property {number}  high
+   * @property {number}  low
+   * @property {number}  close
+   * @property {number}  volume
+   * @property {boolean} isClosed     — true = vela fechada
+   * @property {number}  openTime     — timestamp ms
+   * @property {number}  closeTime    — timestamp ms
+   */
+
+  function PriceTracker (opts) {
+    this._opts    = Object.assign({}, DEFAULTS, opts || {})
+    this._state   = new Map()      // symbol → PriceData
+    this._conns   = []             // array de WSConn
+    this._subs    = new Map()      // symbol → Set<'mini'|'book'|'trade'|'kline'|'depth'>
+    this._klSubs  = new Map()      // symbol+interval → Set
+    this._dpSubs  = new Map()      // symbol+depth → Set
+    this._listeners = new Map()    // event → Set<fn>
+    this._running = false
+    this._pingTimers = []
+  }
+
+  /* ─── CYCLE ─────────────────────────────────────────────────── */
+
+  /**
+   * Inicia o tracker e subscreve streams de preço para os símbolos fornecidos.
+   *
+   * @param {string[]} symbols — lista de símbolos, ex: ['BTCUSDT','ETHUSDT']
+   * @param {object}   [startOpts]
+   * @param {boolean}  [startOpts.prefetch=true]  — carregar preços iniciais via REST antes do WS
+   * @returns {Promise<void>}
+   */
+  PriceTracker.prototype.start = async function (symbols, startOpts) {
+    if (this._running) {
+      console.warn('[BinancePrice] já em execução. Chama stop() primeiro.')
+      return
     }
-  }
+    this._running = true
+    const opts = Object.assign({ prefetch: true }, startOpts || {})
 
-  // ─── REST ────────────────────────────────────────────────────
+    this._log('start()', symbols.length, 'símbolos')
 
-  async function get(url) {
-    const r = await fetchFn(url)
-    if (!r.ok) throw new Error(`HTTP ${r.status}`)
-    return r.json()
-  }
-
-  async function loadPerps() {
-    try {
-      const d = await get(EP.futures.exch)
-      S.perps.clear()
-      for (const s of d.symbols || []) {
-        if (s.contractType !== 'PERPETUAL') continue
-        if (s.status !== 'TRADING') continue
-        if (S.opts.excludeKw.some(k => s.symbol.includes(k))) continue
-        S.perps.add(s.symbol)
-      }
-      _log(`[perps] ${S.perps.size} perpétuos válidos`)
-    } catch (err) {
-      _log('[perps] erro:', err.message)
-    }
-  }
-
-  async function loadRanking(mkt) {
-    const isSpot = mkt === 'spot'
-    const quote  = isSpot ? S.opts.spotQuote : S.opts.futuresQuote
-    const data   = await get(EP[mkt].rest)
-
-    const filtered = data
-      .filter(t => {
-        if (!t.symbol.endsWith(quote)) return false
-        if (S.opts.excludeKw.some(k => t.symbol.includes(k))) return false
-        if (!isSpot && S.perps.size > 0 && !S.perps.has(t.symbol)) return false
-        return true
-      })
-      .sort((a, b) => +b.quoteVolume - +a.quoteVolume)
-      .slice(0, S.opts.topN)
-
-    const newSyms = filtered.map(t => t.symbol)
-    S.symbols[mkt] = newSyms
-
-    filtered.forEach((t, i) => {
-      const ex = S.entries[mkt].get(t.symbol)
-      if (ex) {
-        ex.rank      = i + 1
-        ex.change24h = +t.priceChangePercent
-        ex.vol24h    = +t.quoteVolume
-      } else {
-        S.entries[mkt].set(t.symbol, mkEntry(t.symbol, mkt, i+1, t))
-      }
+    /* Inicializar state para cada símbolo */
+    symbols.forEach(sym => {
+      if (!this._state.has(sym)) this._state.set(sym, _mkState(sym, this._opts.market))
+      const subs = this._subs.get(sym) || new Set()
+      this._subs.set(sym, subs)
     })
 
-    _log(`[${mkt}] ranking: ${newSyms.length}`)
-    emit('ranking', { mkt, symbols: newSyms })
-  }
+    /* Carregar preços iniciais via REST (evita "aguardar primeiro tick WS") */
+    if (opts.prefetch) {
+      await this._fetchInitial(symbols)
+    }
 
-  // ─── PROCESSADORES ──────────────────────────────────────────
+    /* Abrir streams de preço */
+    this._openPriceStreams(symbols)
+
+    this._emit('status', { status: 'started', symbols, market: this._opts.market })
+  }
 
   /**
-   * aggTrade — base de toda a análise buy/sell
-   * m = false → BUY taker (comprador foi agressivo)
-   * m = true  → SELL taker (vendedor foi agressivo)
+   * Para todos os streams e liberta recursos.
    */
-  function onAggTrade(mkt, d) {
-    const e = S.entries[mkt].get(d.s)
-    if (!e) return
-
-    const price = +d.p, qty = +d.q, vol = price * qty
-    const buy   = !d.m
-    const ts    = d.T
-    const pd    = e.lastTs > 0 ? price - e.price : 0
-
-    e.prevPrice = e.price
-    e.price     = price
-    e.lastTs    = ts
-
-    if (buy) {
-      e.sessBuy += vol
-      if (pd > 0) e.sessBuyImpact += Math.abs(pd) * vol
-    } else {
-      e.sessSell += vol
-      if (pd < 0) e.sessSellImpact += Math.abs(pd) * vol
-    }
-    e.sessCount++
-
-    e._trades.push({ ts, vol, buy, pd })
-    const cut5 = ts - S.opts.window5Ms
-    while (e._trades.length && e._trades[0].ts < cut5) e._trades.shift()
-
-    const prevKey = e.sigKey
-    recompute(e, ts)
-
-    emit('tick', snap(e))
-
-    // Emitir 'extreme' apenas quando há transição para um estado extremo
-    if (e.sigKey !== prevKey && e.sigKey !== 'off') {
-      emit('extreme', snap(e))
-    }
+  PriceTracker.prototype.stop = function () {
+    this._running = false
+    this._pingTimers.forEach(t => clearInterval(t))
+    this._pingTimers = []
+    this._conns.forEach(c => {
+      c.closing = true
+      try { c.ws.close() } catch (_) {}
+    })
+    this._conns = []
+    this._emit('status', { status: 'stopped' })
+    this._log('stop()')
   }
 
-  function onMarkPrice(d) {
-    const e = S.entries.futures.get(d.s)
-    if (!e) return
-    e.markPrice    = +d.p
-    e.fundingRate  = +d.r
-    e.msToFunding  = +d.T - Date.now()
-    emit('mark', snap(e))
+  /**
+   * Para e reinicia com novos símbolos (mantém listeners).
+   * @param {string[]} symbols
+   */
+  PriceTracker.prototype.restart = async function (symbols) {
+    this.stop()
+    this._running = false
+    this._state   = new Map()
+    this._subs    = new Map()
+    this._klSubs  = new Map()
+    this._dpSubs  = new Map()
+    await new Promise(r => setTimeout(r, 500))
+    await this.start(symbols)
   }
 
-  function onMiniTicker(mkt, d) {
-    const e = S.entries[mkt].get(d.s)
-    if (!e) return
-    e.prevPrice = e.price
-    e.price     = +d.c
-    e.vol24h    = +d.q
-    if (+d.o > 0) e.change24h = (+d.c - +d.o) / +d.o * 100
+  /* ─── ADICIONAR/REMOVER SÍMBOLOS EM RUNTIME ─────────────────── */
+
+  /**
+   * Adiciona símbolos ao tracker enquanto está a correr.
+   * @param {string[]} symbols
+   */
+  PriceTracker.prototype.subscribe = async function (symbols) {
+    const newSyms = symbols.filter(s => !this._subs.has(s))
+    if (!newSyms.length) return
+
+    newSyms.forEach(sym => {
+      if (!this._state.has(sym)) this._state.set(sym, _mkState(sym, this._opts.market))
+      this._subs.set(sym, new Set())
+    })
+
+    await this._fetchInitial(newSyms)
+    this._openPriceStreams(newSyms)
+    this._log('subscribe()', newSyms)
   }
 
-  // ─── RECOMPUTE ───────────────────────────────────────────────
-
-  function recompute(e, nowTs) {
-    const cut1 = nowTs - S.opts.window1Ms
-    const cut5 = nowTs - S.opts.window5Ms
-    let b1=0, s1=0, bi1=0, si1=0, b5=0, s5=0
-
-    for (const tr of e._trades) {
-      if (tr.ts >= cut5) { tr.buy ? b5+=tr.vol : s5+=tr.vol }
-      if (tr.ts >= cut1) {
-        if (tr.buy) { b1+=tr.vol; if(tr.pd>0) bi1+=Math.abs(tr.pd)*tr.vol }
-        else         { s1+=tr.vol; if(tr.pd<0) si1+=Math.abs(tr.pd)*tr.vol }
-      }
-    }
-
-    e.w1Buy=b1; e.w1Sell=s1; e.w1Delta=b1-s1; e.w1BI=bi1; e.w1SI=si1
-    e.w5Buy=b5; e.w5Sell=s5
-
-    const tS=e.sessBuy+e.sessSell, t1=b1+s1, t5=b5+s5
-    e.sessRatio = tS>0 ? e.sessBuy/tS*100 : 50
-    e.w1Ratio   = t1>0 ? b1/t1*100 : 50
-    e.w5Ratio   = t5>0 ? b5/t5*100 : 50
-
-    // Pressão combinada -100..+100 (peso maior para janela recente)
-    e.pressure = (e.w1Ratio-50)*2*.55 + (e.w5Ratio-50)*2*.30 + (e.sessRatio-50)*2*.15
-
-    const ti = e.sessBuyImpact + e.sessSellImpact
-    e.impactRatio = ti > 0 ? e.sessBuyImpact/ti*100 : 50
-
-    // ── STICKY SIGNAL ───────────────────────────────────
-    // O sinal só muda quando a pressão cruza os limiares extremos.
-    // Não mostra estados intermédios: apenas extreme_buy / extreme_sell.
-    const p = e.pressure
-    if (p >= 72) {
-      e.sigKey = 'extreme_buy'
-      e.sigTxt = '🔥 COMPRA MAX'
-    } else if (p <= -72) {
-      e.sigKey = 'extreme_sell'
-      e.sigTxt = '💀 VENDA MAX'
-    }
-    // else: mantém e.sigKey e e.sigTxt inalterados
+  /**
+   * Remove símbolos do tracker.
+   * Fecha as conexões WS dos streams removidos (se exclusivas).
+   * @param {string[]} symbols
+   */
+  PriceTracker.prototype.unsubscribe = function (symbols) {
+    symbols.forEach(sym => {
+      this._subs.delete(sym)
+      this._state.delete(sym)
+    })
+    // Reconectar streams (elimina os streams dos símbolos removidos)
+    const remaining = Array.from(this._subs.keys())
+    this._closeAllConns()
+    if (remaining.length) this._openPriceStreams(remaining)
+    this._log('unsubscribe()', symbols)
   }
 
-  // ─── SNAPSHOT ────────────────────────────────────────────────
+  /* ─── STREAMS ADICIONAIS ─────────────────────────────────────── */
 
-  function snap(e) {
-    const { _trades, ...out } = e
-    return { ...out, _ts: Date.now() }
+  /**
+   * Subscreve stream de trades individuais (aggTrade) para um ou mais símbolos.
+   * Emite evento 'trade' com dados de cada trade.
+   * @param {string|string[]} symbols
+   */
+  PriceTracker.prototype.subscribeTrades = function (symbols) {
+    const syms = Array.isArray(symbols) ? symbols : [symbols]
+    const streams = syms.map(s => s.toLowerCase() + '@aggTrade')
+    this._openRawStreams(streams, 'trade')
+    this._log('subscribeTrades()', syms)
   }
 
-  function getAll() {
-    return {
-      spot:    S.symbols.spot.map(s => S.entries.spot.get(s)).filter(Boolean).map(snap),
-      futures: S.symbols.futures.map(s => S.entries.futures.get(s)).filter(Boolean).map(snap),
-      ts:      Date.now(),
-    }
+  /**
+   * Subscreve stream de velas (kline) para um símbolo e intervalo.
+   * Emite evento 'kline' a cada actualização.
+   *
+   * @param {string} symbol      — ex: 'BTCUSDT'
+   * @param {string} interval    — '1m'|'3m'|'5m'|'15m'|'30m'|'1h'|'2h'|'4h'|'6h'|'12h'|'1d'|'3d'|'1w'|'1M'
+   */
+  PriceTracker.prototype.subscribeKline = function (symbol, interval) {
+    const stream = symbol.toLowerCase() + '@kline_' + interval
+    this._openRawStreams([stream], 'kline')
+    this._log('subscribeKline()', symbol, interval)
   }
 
-  // ─── WS FACTORY ─────────────────────────────────────────────
-
-  function openWS(url, onMsg, id) {
-    const ws = new WSImpl(url)
-    ws.onopen    = () => { _log(`[WS ${id}] conectado`); emit('status', { id, status: 'connected' }) }
-    ws.onmessage = ev => {
-      try {
-        const d = JSON.parse(typeof ev.data==='string' ? ev.data : ev.data.toString())
-        onMsg(d.data || d)
-      } catch(_) {}
-    }
-    ws.onerror   = () => emit('status', { id, status: 'error' })
-    ws.onclose   = () => emit('status', { id, status: 'closed' })
-    return ws
+  /**
+   * Subscreve stream de order book parcial.
+   * Emite evento 'depth' com bids e asks.
+   *
+   * @param {string} symbol   — ex: 'BTCUSDT'
+   * @param {number} [levels] — 5 | 10 | 20
+   * @param {number} [speed]  — 100 (100ms) | 1000 (1s)
+   */
+  PriceTracker.prototype.subscribeDepth = function (symbol, levels, speed) {
+    const lvl   = [5, 10, 20].includes(levels) ? levels : 10
+    const spd   = speed === 100 ? '@100ms' : ''
+    const stream = symbol.toLowerCase() + '@depth' + lvl + spd
+    this._openRawStreams([stream], 'depth')
+    this._log('subscribeDepth()', symbol, lvl)
   }
 
-  function withReconnect(connKey, buildFn, delay) {
-    let closing = false
-    const connect = () => {
-      if (S.conns[connKey]) { S.conns[connKey]._closing = true; try { S.conns[connKey].ws.close() } catch(_){} }
-      const ws = buildFn()
-      ws.addEventListener('close', () => {
-        if (!closing && !ws._closing) setTimeout(connect, delay || S.opts.reconnectMs)
+  /**
+   * Subscreve ticker 24h completo para símbolos adicionais.
+   * Emite evento 'ticker'.
+   * @param {string[]} symbols
+   */
+  PriceTracker.prototype.subscribeTicker = function (symbols) {
+    const syms = Array.isArray(symbols) ? symbols : [symbols]
+    const streams = syms.map(s => s.toLowerCase() + '@ticker')
+    this._openRawStreams(streams, 'ticker')
+    this._log('subscribeTicker()', syms)
+  }
+
+  /* ─── EVENTOS ─────────────────────────────────────────────────── */
+
+  /**
+   * Regista um listener para um evento.
+   *
+   * @param {string}   event  — 'price'|'trade'|'kline'|'depth'|'ticker'|'connect'|'disconnect'|'error'|'status'
+   * @param {function} fn     — callback(data)
+   * @returns {function}        função para remover o listener (unsubscribe)
+   *
+   * @example
+   * const off = tracker.on('price', data => {
+   *   console.log(data.symbol, data.price, data.changePct + '%')
+   * })
+   * // Para remover:
+   * off()
+   */
+  PriceTracker.prototype.on = function (event, fn) {
+    if (!this._listeners.has(event)) this._listeners.set(event, new Set())
+    this._listeners.get(event).add(fn)
+    return () => this.off(event, fn)
+  }
+
+  /**
+   * Remove um listener.
+   * @param {string}   event
+   * @param {function} fn
+   */
+  PriceTracker.prototype.off = function (event, fn) {
+    this._listeners.get(event)?.delete(fn)
+  }
+
+  /**
+   * Regista um listener que dispara apenas uma vez.
+   * @param {string}   event
+   * @param {function} fn
+   */
+  PriceTracker.prototype.once = function (event, fn) {
+    const off = this.on(event, data => { fn(data); off() })
+  }
+
+  /* ─── DADOS ─────────────────────────────────────────────────── */
+
+  /**
+   * Obtém os dados de preço actuais de um símbolo.
+   * @param {string} symbol
+   * @returns {PriceData|null}
+   */
+  PriceTracker.prototype.getPrice = function (symbol) {
+    const s = this._state.get(symbol)
+    return s ? _snapState(s) : null
+  }
+
+  /**
+   * Obtém todos os dados de preço actuais.
+   * @returns {PriceData[]}
+   */
+  PriceTracker.prototype.getAllPrices = function () {
+    return Array.from(this._state.values()).map(_snapState)
+  }
+
+  /**
+   * Obtém o estado das conexões WebSocket.
+   * @returns {object[]}
+   */
+  PriceTracker.prototype.getConnectionStatus = function () {
+    return this._conns.map((c, i) => ({
+      idx:        i,
+      streams:    c.streams.length,
+      state:      ['CONNECTING','OPEN','CLOSING','CLOSED'][c.ws?.readyState] || 'UNKNOWN',
+      reconnects: c.reconnects,
+    }))
+  }
+
+  /* ─── INTERNO — REST ─────────────────────────────────────────── */
+
+  PriceTracker.prototype._fetchInitial = async function (symbols) {
+    const market  = this._opts.market
+    const baseUrl = ENDPOINTS[market].rest
+    try {
+      /* Binance suporta single-ticker e multi-ticker */
+      const url = symbols.length === 1
+        ? `${baseUrl}/ticker/24hr?symbol=${symbols[0]}`
+        : `${baseUrl}/ticker/24hr`
+      const res  = await fetchFn(url)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const arr  = Array.isArray(data) ? data : [data]
+      const symSet = new Set(symbols)
+      arr.filter(t => symSet.has(t.symbol)).forEach(t => {
+        const s = this._state.get(t.symbol)
+        if (!s) return
+        _applyTicker24h(s, t)
+        this._emit('price', _snapState(s))
       })
-      S.conns[connKey] = { ws, close: () => { closing=true; ws._closing=true; try{ws.close()}catch(_){} } }
+      this._log('fetchInitial()', symbols.length, 'tickers carregados')
+    } catch (err) {
+      this._log('fetchInitial() erro:', err.message)
     }
-    connect()
   }
 
-  // ─── SPOT WS (aggTrade + miniTicker) ────────────────────────
+  /* ─── INTERNO — STREAMS ─────────────────────────────────────── */
 
-  function openSpotWS() {
-    const syms = S.symbols.spot
-    const streams = syms.flatMap(s => [s.toLowerCase()+'@aggTrade', s.toLowerCase()+'@miniTicker'])
-    const url = EP.spot.wsBase + '?streams=' + streams.join('/')
-    withReconnect('spot', () => openWS(url, d => {
-      if (!d?.e) return
-      if (d.e === 'aggTrade')       onAggTrade('spot', d)
-      if (d.e === '24hrMiniTicker') onMiniTicker('spot', d)
-    }, 'spot'))
+  PriceTracker.prototype._openPriceStreams = function (symbols) {
+    const mode   = this._opts.priceStream
+    const market = this._opts.market
+    const streams = []
+
+    symbols.forEach(sym => {
+      const sl = sym.toLowerCase()
+      if (mode === 'mini' || mode === 'both') streams.push(sl + '@miniTicker')
+      if (mode === 'book' || mode === 'both') streams.push(sl + '@bookTicker')
+      if (mode === 'full')                    streams.push(sl + '@ticker')
+    })
+
+    this._openRawStreams(streams, 'price')
   }
 
-  // ─── FUTURES PUBLIC WS (aggTrade + miniTicker) ──────────────
+  PriceTracker.prototype._openRawStreams = function (streamNames, type) {
+    const market  = this._opts.market
+    const base    = ENDPOINTS[market].ws
+    const maxPer  = this._opts.maxStreamsPerConn
 
-  function openFutPublicWS() {
-    const syms = S.symbols.futures
-    const streams = syms.flatMap(s => [s.toLowerCase()+'@aggTrade', s.toLowerCase()+'@miniTicker'])
-    const url = EP.futures.wsPub + '?streams=' + streams.join('/')
-    withReconnect('futPub', () => openWS(url, d => {
-      if (!d?.e) return
-      if (d.e === 'aggTrade')       onAggTrade('futures', d)
-      if (d.e === '24hrMiniTicker') onMiniTicker('futures', d)
-    }, 'fut-pub'))
+    /* Dividir em grupos respeitando o limite por conexão */
+    for (let i = 0; i < streamNames.length; i += maxPer) {
+      const group = streamNames.slice(i, i + maxPer)
+      const url   = base + '?streams=' + group.join('/')
+      const conn  = { ws: null, streams: group, type, closing: false, reconnects: 0 }
+      this._conns.push(conn)
+      this._connectWS(conn, url)
+    }
   }
 
-  // ─── FUTURES MARKET WS (markPrice) ──────────────────────────
-  // Requer rota /market — não disponível no /stream genérico
+  PriceTracker.prototype._connectWS = function (conn, url) {
+    this._log(`[WS] conectando (${conn.streams.length} streams, tipo:${conn.type})`)
 
-  function openFutMarketWS() {
-    const syms    = S.symbols.futures
-    const streams = syms.map(s => s.toLowerCase()+'@markPrice@1s')
-    const url     = EP.futures.wsMkt + '?streams=' + streams.join('/')
-    withReconnect('futMkt', () => openWS(url, d => {
-      if (d?.e === 'markPriceUpdate') onMarkPrice(d)
-    }, 'fut-mkt'))
-  }
-
-  // ─── FUTURES WebSocket API ───────────────────────────────────
-  //
-  // wss://ws-fapi.binance.com/ws-fapi/v1
-  //
-  // Protocolo request/response:
-  //   Envio:   { "id": "string", "method": "depth", "params": { "symbol": "BTCUSDT", "limit": 10 } }
-  //   Resposta:{ "id": "string", "status": 200, "result": { "bids": [...], "asks": [...] } }
-  //
-  // Usado para obter snapshots de depth a pedido (em vez de stream contínuo),
-  // pois a ws-fapi não suporta subscrições — é exclusivamente request/response.
-
-  function openFutApiWS() {
-    if (S.conns.futApi) { try { S.conns.futApi.ws.close() } catch(_){} }
-
-    const ws = new WSImpl(EP.futures.wsApi)
-    S.conns.futApi = { ws }
+    const ws = new WSImpl(url)
+    conn.ws  = ws
 
     ws.onopen = () => {
-      _log('[ws-fapi] conectado')
-      emit('status', { id: 'fut-api', status: 'connected' })
-      // Se o book está aberto em futures, arrancar o poll
-      if (S.book.sym && S.book.mkt === 'futures') _startFutApiPoll()
-    }
+      this._log('[WS] aberto')
+      conn.reconnects = 0
 
-    ws.onmessage = ev => {
-      try {
-        const msg = JSON.parse(typeof ev.data==='string' ? ev.data : ev.data.toString())
-        // Resposta normal: { id, status, result }
-        const cb = S.book.apiPending.get(msg.id)
-        if (cb) {
-          S.book.apiPending.delete(msg.id)
-          if (msg.status === 200) cb(null, msg.result)
-          else cb(new Error(msg.error?.msg || 'ws-fapi error ' + msg.status))
+      /* Ping periódico para manter conexão viva */
+      const pingTimer = setInterval(() => {
+        if (ws.readyState === 1) {
+          try {
+            if (typeof ws.ping === 'function') ws.ping()
+            /* Em browser não existe ws.ping() — o servidor envia ping automaticamente */
+          } catch (_) {}
         }
-      } catch(_) {}
+      }, this._opts.pingInterval)
+      this._pingTimers.push(pingTimer)
+
+      this._emit('connect', { streams: conn.streams, type: conn.type })
     }
 
-    ws.onerror = () => emit('status', { id: 'fut-api', status: 'error' })
-    ws.onclose = () => {
-      // Resolver pendentes com erro
-      S.book.apiPending.forEach(cb => cb(new Error('ws-fapi closed')))
-      S.book.apiPending.clear()
-      emit('status', { id: 'fut-api', status: 'closed' })
-      setTimeout(openFutApiWS, S.opts.reconnectMs)
-    }
-  }
-
-  /**
-   * Envia um pedido à ws-fapi e devolve uma Promise com o resultado.
-   * @param {string} method   ex: 'depth'
-   * @param {Object} params   ex: { symbol: 'BTCUSDT', limit: 10 }
-   * @returns {Promise<Object>}
-   */
-  function futApiRequest(method, params) {
-    return new Promise((resolve, reject) => {
-      const ws = S.conns.futApi?.ws
-      if (!ws || ws.readyState !== 1) {
-        reject(new Error('ws-fapi não conectado'))
-        return
-      }
-      const id = String(++S.book.apiSeq)
-      const timeout = setTimeout(() => {
-        S.book.apiPending.delete(id)
-        reject(new Error('ws-fapi timeout'))
-      }, 6000)
-      S.book.apiPending.set(id, (err, result) => {
-        clearTimeout(timeout)
-        err ? reject(err) : resolve(result)
-      })
-      ws.send(JSON.stringify({ id, method, params }))
-    })
-  }
-
-  function _startFutApiPoll() {
-    if (S.book.pollTimer) clearInterval(S.book.pollTimer)
-    const fetch = async () => {
-      if (!S.book.sym || S.book.mkt !== 'futures') {
-        clearInterval(S.book.pollTimer)
-        return
-      }
-      try {
-        const result = await futApiRequest('depth', {
-          symbol: S.book.sym,
-          limit:  S.book.depth,
-        })
-        _emitBook(result.bids, result.asks)
-      } catch (_) {
-        // Fallback: REST depth
-        try {
-          const r = await fetchFn(`${EP.futures.depth}?symbol=${S.book.sym}&limit=${S.book.depth}`)
-          const d = await r.json()
-          _emitBook(d.bids, d.asks)
-        } catch(_) {}
-      }
-    }
-    fetch()
-    S.book.pollTimer = setInterval(fetch, 500)
-  }
-
-  // ─── ORDER BOOK (spot) ───────────────────────────────────────
-  // Para spot usa stream @depth{N}@100ms contínuo
-
-  function _openSpotBookWS(sym, depth) {
-    if (S.conns.obSpot) { try { S.conns.obSpot.ws.close() } catch(_){} }
-    const url = EP.spot.wsBase + '?streams=' + sym.toLowerCase() + '@depth' + depth + '@100ms'
-    const ws  = new WSImpl(url)
-    S.conns.obSpot = { ws }
-    ws.onopen    = () => emit('status', { id: 'ob-spot', status: 'connected' })
     ws.onmessage = ev => {
       try {
-        const d = JSON.parse(typeof ev.data==='string' ? ev.data : ev.data.toString())
-        const raw = d.data || d
-        const bids = raw.bids || raw.b
-        const asks = raw.asks || raw.a
-        if (bids && asks) _emitBook(bids, asks)
-      } catch(_) {}
+        const raw = typeof ev.data === 'string' ? ev.data : ev.data.toString()
+        const msg = JSON.parse(raw)
+        /* Combined stream format: { stream: "name@type", data: {...} } */
+        const d = msg.data || msg
+        if (!d) return
+        this._routeMessage(d, conn.type)
+      } catch (_) {}
     }
-    ws.onerror   = () => emit('status', { id: 'ob-spot', status: 'error' })
-    ws.onclose   = () => {
-      emit('status', { id: 'ob-spot', status: 'closed' })
-      if (S.book.sym === sym && S.book.mkt === 'spot') setTimeout(() => _openSpotBookWS(sym, depth), 3000)
+
+    ws.onerror = err => {
+      this._log('[WS] erro:', err?.message || 'desconhecido')
+      this._emit('error', { error: err, streams: conn.streams })
+    }
+
+    ws.onclose = () => {
+      this._log('[WS] fechado')
+      this._emit('disconnect', { streams: conn.streams })
+      if (!conn.closing && this._opts.autoReconnect && this._running) {
+        const maxR = this._opts.maxReconnects
+        if (maxR > 0 && conn.reconnects >= maxR) {
+          this._log('[WS] máximo de reconexões atingido')
+          return
+        }
+        /* Backoff exponencial (máx 30s) */
+        const delay = Math.min(this._opts.reconnectDelay * Math.pow(1.5, conn.reconnects), 30_000)
+        conn.reconnects++
+        this._log(`[WS] reconexão #${conn.reconnects} em ${Math.round(delay)}ms`)
+        setTimeout(() => this._connectWS(conn, url), delay)
+      }
     }
   }
 
-  // ─── EMIT BOOK ───────────────────────────────────────────────
+  PriceTracker.prototype._closeAllConns = function () {
+    this._conns.forEach(c => { c.closing = true; try { c.ws.close() } catch (_) {} })
+    this._conns = []
+  }
 
-  function _emitBook(rawBids, rawAsks) {
-    if (!S.book.sym || !S.book.mkt) return
+  /* ─── INTERNO — ROTEAMENTO DE MENSAGENS ─────────────────────── */
 
-    const e = S.entries[S.book.mkt].get(S.book.sym)
+  PriceTracker.prototype._routeMessage = function (d, type) {
+    const e = d.e  /* tipo de evento Binance */
 
-    const bids = [...rawBids].map(r => ({ p:+r[0], q:+r[1] })).sort((a,b)=>b.p-a.p)
-    const asks = [...rawAsks].map(r => ({ p:+r[0], q:+r[1] })).sort((a,b)=>a.p-b.p)
+    switch (e) {
+      /* ── miniTicker ───────────────────────────────────────── */
+      case '24hrMiniTicker': {
+        const s = this._state.get(d.s)
+        if (!s) return
+        const prev = s.price
+        s.prevPrice    = prev
+        s.price        = +d.c
+        s.open         = +d.o
+        s.high         = +d.h
+        s.low          = +d.l
+        s.volume       = +d.v
+        s.quoteVolume  = +d.q
+        s.change       = +d.c - +d.o
+        s.changePct    = +d.o > 0 ? ((+d.c - +d.o) / +d.o) * 100 : 0
+        s.lastTs       = d.E
+        this._emit('price', _snapState(s))
+        break
+      }
 
-    const bestBid   = bids[0]?.p || 0
-    const bestAsk   = asks[0]?.p || 0
-    const spread    = bestBid && bestAsk ? bestAsk - bestBid : 0
-    const spreadPct = bestBid ? spread/bestBid*100 : 0
-    const maxQty    = Math.max(...bids.map(r=>r.q), ...asks.map(r=>r.q), 1)
+      /* ── bookTicker ──────────────────────────────────────── */
+      case undefined: /* bookTicker não tem campo 'e' */
+      case 'bookTicker': {
+        /* bookTicker: { u, s, b, B, a, A } */
+        if (!d.s || !d.b) break
+        const s = this._state.get(d.s)
+        if (!s) return
+        s.bidPrice  = +d.b
+        s.bidQty    = +d.B
+        s.askPrice  = +d.a
+        s.askQty    = +d.A
+        s.spread    = +d.a - +d.b
+        s.spreadPct = +d.b > 0 ? (+d.a - +d.b) / +d.b * 100 : 0
+        /* Actualizar preço com mid-price se não tiver miniTicker */
+        if (!s.price) s.price = (+d.b + +d.a) / 2
+        this._emit('price', _snapState(s))
+        break
+      }
 
-    let bidCum=0, askCum=0
-    bids.forEach(r => { bidCum += r.p*r.q; r.total=bidCum; r.depthPct=r.q/maxQty*100 })
-    asks.forEach(r => { askCum += r.p*r.q; r.total=askCum; r.depthPct=r.q/maxQty*100 })
+      /* ── ticker 24h completo ─────────────────────────────── */
+      case '24hrTicker': {
+        const s = this._state.get(d.s)
+        if (!s) return
+        s.prevPrice   = s.price
+        s.price       = +d.c
+        s.open        = +d.o
+        s.high        = +d.h
+        s.low         = +d.l
+        s.volume      = +d.v
+        s.quoteVolume = +d.q
+        s.change      = +d.p
+        s.changePct   = +d.P
+        s.bidPrice    = +d.b
+        s.askPrice    = +d.a
+        s.spread      = +d.a - +d.b
+        s.spreadPct   = +d.b > 0 ? (+d.a - +d.b) / +d.b * 100 : 0
+        s.lastTs      = d.E
+        this._emit('price', _snapState(s))
+        this._emit('ticker', {
+          symbol:      d.s,
+          price:       +d.c,
+          change:      +d.p,
+          changePct:   +d.P,
+          high:        +d.h,
+          low:         +d.l,
+          volume:      +d.v,
+          quoteVolume: +d.q,
+          open:        +d.o,
+          bidPrice:    +d.b,
+          askPrice:    +d.a,
+          trades:      +d.n,
+          ts:          d.E,
+        })
+        break
+      }
 
-    emit('book', {
-      sym: S.book.sym, mkt: S.book.mkt, depth: S.book.depth,
-      bids, asks, bestBid, bestAsk, spread, spreadPct, maxQty,
-      lastPrice:   e?.price || 0,
-      markPrice:   e?.markPrice || 0,
-      fundingRate: e?.fundingRate || 0,
-      ts: Date.now(),
+      /* ── aggTrade ────────────────────────────────────────── */
+      case 'aggTrade': {
+        const s = this._state.get(d.s)
+        if (s) {
+          s.prevPrice = s.price
+          s.price     = +d.p
+          s.lastTs    = d.T
+        }
+        /** @type {TradeData} */
+        const trade = {
+          symbol:   d.s,
+          price:    +d.p,
+          qty:      +d.q,
+          quoteQty: +d.p * +d.q,
+          isBuy:    !d.m,   /* m=false → buyer was taker = BUY */
+          ts:       d.T,
+          tradeId:  String(d.a),
+          market:   this._opts.market,
+        }
+        if (s) this._emit('price', _snapState(s))
+        this._emit('trade', trade)
+        break
+      }
+
+      /* ── kline ───────────────────────────────────────────── */
+      case 'kline': {
+        const k = d.k
+        if (!k) break
+        const s = this._state.get(d.s)
+        if (s) {
+          s.prevPrice = s.price
+          s.price     = +k.c
+          s.lastTs    = k.t
+        }
+        /** @type {KlineData} */
+        const kline = {
+          symbol:    d.s,
+          interval:  k.i,
+          open:      +k.o,
+          high:      +k.h,
+          low:       +k.l,
+          close:     +k.c,
+          volume:    +k.v,
+          quoteVol:  +k.q,
+          trades:    +k.n,
+          isClosed:  k.x,
+          openTime:  k.t,
+          closeTime: k.T,
+          market:    this._opts.market,
+        }
+        if (s) this._emit('price', _snapState(s))
+        this._emit('kline', kline)
+        break
+      }
+
+      /* ── depth (order book parcial) ─────────────────────── */
+      case 'depthUpdate': {
+        this._emit('depth', {
+          symbol:        d.s,
+          lastUpdateId:  d.u,
+          bids:          (d.b || []).map(r => ({ price: +r[0], qty: +r[1] })),
+          asks:          (d.a || []).map(r => ({ price: +r[0], qty: +r[1] })),
+          ts:            d.E,
+          market:        this._opts.market,
+        })
+        break
+      }
+
+      /* ── markPriceUpdate (futures) ───────────────────────── */
+      case 'markPriceUpdate': {
+        const s = this._state.get(d.s)
+        if (!s) return
+        s.markPrice    = +d.p
+        s.indexPrice   = +d.i
+        s.fundingRate  = +d.r
+        s.nextFunding  = +d.T
+        s.lastTs       = d.E
+        this._emit('price', _snapState(s))
+        break
+      }
+
+      default:
+        /* Mensagem desconhecida — ignorar */
+        break
+    }
+  }
+
+  /* ─── INTERNO — HELPERS ─────────────────────────────────────── */
+
+  PriceTracker.prototype._emit = function (event, data) {
+    const ls = this._listeners.get(event)
+    if (!ls || !ls.size) return
+    ls.forEach(fn => {
+      try { fn(data) }
+      catch (err) { console.error('[BinancePrice] listener error:', err) }
     })
   }
 
-  // ─── SUBSCRIBE BOOK (API pública) ───────────────────────────
-
-  /**
-   * Subscreve o order book de um símbolo.
-   * @param {string} sym    ex: 'BTCUSDC', 'BTCUSDT'
-   * @param {string} mkt    'spot' | 'futures'
-   * @param {number} depth  5 | 10 | 20
-   */
-  function subscribeBook(sym, mkt, depth = 5) {
-    // Parar subscrição anterior
-    if (S.book.pollTimer) { clearInterval(S.book.pollTimer); S.book.pollTimer = null }
-    if (S.conns.obSpot)   { try { S.conns.obSpot.ws.close() } catch(_){} }
-
-    S.book.sym   = sym
-    S.book.mkt   = mkt
-    S.book.depth = depth
-
-    if (mkt === 'futures') {
-      // Usar ws-fapi request/response com polling 500ms
-      if (S.conns.futApi?.ws?.readyState === 1) {
-        _startFutApiPoll()
-      } else {
-        // ws-fapi a reconectar — quando abrir vai arrancar o poll automaticamente
-        emit('status', { id: 'ob-fut', status: 'connecting' })
-      }
-    } else {
-      // Spot: stream contínuo @depth{N}@100ms
-      _openSpotBookWS(sym, depth)
-    }
-
-    emit('status', { id: 'book', status: 'subscribed', sym, mkt, depth })
+  PriceTracker.prototype._log = function (...args) {
+    if (this._opts.debug) console.log('[BinancePrice]', ...args)
   }
 
-  function unsubscribeBook() {
-    if (S.book.pollTimer) { clearInterval(S.book.pollTimer); S.book.pollTimer = null }
-    if (S.conns.obSpot)   { try { S.conns.obSpot.ws.close() } catch(_){} }
-    S.book.sym = null; S.book.mkt = null
-    emit('status', { id: 'book', status: 'unsubscribed' })
-  }
+  /* ════════════════════════════════════════════════════════════════
+     STATE FACTORY & HELPERS
+  ════════════════════════════════════════════════════════════════ */
 
-  // ─── SUMMARY ────────────────────────────────────────────────
-
-  function getSummary(mkt) {
-    const entries = S.symbols[mkt].map(s => S.entries[mkt].get(s)).filter(Boolean)
-    if (!entries.length) return null
-    let tB=0, tS=0, tBI=0, tSI=0, w1B=0, w1S=0
-    for (const e of entries) {
-      tB+=e.sessBuy; tS+=e.sessSell
-      tBI+=e.sessBuyImpact; tSI+=e.sessSellImpact
-      w1B+=e.w1Buy; w1S+=e.w1Sell
-    }
-    const tv=tB+tS, ti=tBI+tSI, tw=w1B+w1S
-    const sessRatio   = tv>0 ? tB/tv*100 : 50
-    const impactRatio = ti>0 ? tBI/ti*100 : 50
-    const w1Ratio     = tw>0 ? w1B/tw*100 : 50
-    const byW1 = [...entries].sort((a,b)=>Math.abs(b.w1Delta)-Math.abs(a.w1Delta))
-    const byP  = [...entries].sort((a,b)=>Math.abs(b.pressure)-Math.abs(a.pressure))
-    const extr = entries.filter(e => e.sigKey !== 'off')
+  function _mkState (symbol, market) {
     return {
-      mkt, sessRatio, impactRatio, w1Ratio,
-      totalBuyVol: tB, totalSellVol: tS, totalVol: tv,
-      delta: tB-tS, w1Delta: w1B-w1S,
-      dominantSide:  sessRatio>=50 ? 'buy' : 'sell',
-      priceMover:    impactRatio>=50 ? 'buyers' : 'sellers',
-      topW1Mover:    byW1[0] ? snap(byW1[0]) : null,
-      topPressure:   byP[0]  ? snap(byP[0])  : null,
-      extremeSignals: extr.map(snap),
-      count: entries.length, ts: Date.now(),
+      symbol,
+      market,
+      price:       0,
+      prevPrice:   0,
+      open:        0,
+      high:        0,
+      low:         0,
+      change:      0,
+      changePct:   0,
+      volume:      0,
+      quoteVolume: 0,
+      bidPrice:    0,
+      bidQty:      0,
+      askPrice:    0,
+      askQty:      0,
+      spread:      0,
+      spreadPct:   0,
+      markPrice:   0,
+      indexPrice:  0,
+      fundingRate: 0,
+      nextFunding: 0,
+      lastTs:      0,
     }
   }
 
-  // ─── EVENTOS ─────────────────────────────────────────────────
-
-  function on(event, fn) {
-    if (!S.listeners.has(event)) S.listeners.set(event, new Set())
-    S.listeners.get(event).add(fn)
-    return () => off(event, fn)
+  function _snapState (s) {
+    return Object.assign({}, s)
   }
 
-  function off(event, fn) { S.listeners.get(event)?.delete(fn) }
-
-  function emit(event, data) {
-    const ls = S.listeners.get(event)
-    if (!ls?.size) return
-    ls.forEach(fn => { try { fn(data) } catch(e) { console.error('[BinanceV2]', e) } })
+  function _applyTicker24h (s, t) {
+    s.price       = +t.lastPrice
+    s.prevPrice   = +t.lastPrice
+    s.open        = +t.openPrice
+    s.high        = +t.highPrice
+    s.low         = +t.lowPrice
+    s.change      = +t.priceChange
+    s.changePct   = +t.priceChangePercent
+    s.volume      = +t.volume
+    s.quoteVolume = +t.quoteVolume
+    s.bidPrice    = +t.bidPrice  || 0
+    s.askPrice    = +t.askPrice  || 0
+    s.lastTs      = +t.closeTime || Date.now()
+    if (s.askPrice && s.bidPrice) {
+      s.spread    = s.askPrice - s.bidPrice
+      s.spreadPct = s.bidPrice > 0 ? s.spread / s.bidPrice * 100 : 0
+    }
   }
 
-  // ─── START / STOP ─────────────────────────────────────────────
+  /* ════════════════════════════════════════════════════════════════
+     FORMATOS UTILITÁRIOS (exportados)
+  ════════════════════════════════════════════════════════════════ */
 
   /**
-   * @param {Object} [opts]
-   * @param {number}   [opts.topN=25]
-   * @param {string}   [opts.spotQuote='USDC']
-   * @param {string}   [opts.futuresQuote='USDT']
-   * @param {number}   [opts.window1Ms=60000]
-   * @param {number}   [opts.window5Ms=300000]
-   * @param {number}   [opts.refreshMs=30000]
-   * @param {boolean}  [opts.debug=false]
+   * Formata preço com precisão adaptativa.
+   * @param {number} n
+   * @returns {string}
    */
-  async function start(opts = {}) {
-    if (S.running) { console.warn('[BinanceV2] já em execução'); return }
-    S.opts    = { ...DEFAULTS, ...opts }
-    S.running = true
-    _log('iniciando...', S.opts)
-
-    await loadPerps()
-    await Promise.all(['spot','futures'].map(loadRanking))
-
-    openSpotWS()
-    openFutPublicWS()
-    openFutMarketWS()
-    openFutApiWS()
-
-    S.timers.push(setInterval(() => emit('update', getAll()), S.opts.updateHz))
-
-    S.timers.push(setInterval(async () => {
-      try {
-        await loadPerps()
-        const ops = ['spot','futures'].map(async mkt => {
-          const old = S.symbols[mkt].join()
-          await loadRanking(mkt)
-          if (S.symbols[mkt].join() !== old) {
-            if (mkt === 'spot') openSpotWS()
-            else { openFutPublicWS(); openFutMarketWS() }
-          }
-        })
-        await Promise.all(ops)
-      } catch (err) { _log('[refresh]', err.message) }
-    }, S.opts.refreshMs))
-
-    _log('iniciado ✓')
-  }
-
-  function stop() {
-    S.running = false
-    S.timers.forEach(t => clearInterval(t)); S.timers = []
-    Object.values(S.conns).forEach(c => { if (c) try { c.ws?.close() || c.close?.() } catch(_){} })
-    unsubscribeBook()
-    emit('status', { id: 'all', status: 'stopped' })
-    _log('parado ✓')
-  }
-
-  async function restart(opts) {
-    stop(); S.running=false
-    S.entries = { spot: new Map(), futures: new Map() }
-    S.symbols = { spot: [], futures: [] }
-    await new Promise(r => setTimeout(r, 600))
-    await start(opts || S.opts)
-  }
-
-  // ─── UTILITÁRIOS ─────────────────────────────────────────────
-
-  function fmtVol(n) {
-    if (n==null||isNaN(n)) return '—'
-    if (n>=1e9) return (n/1e9).toFixed(2)+'B'
-    if (n>=1e6) return (n/1e6).toFixed(2)+'M'
-    if (n>=1e3) return (n/1e3).toFixed(1)+'K'
-    return n.toFixed(2)
-  }
-
-  function fmtPrice(n) {
-    if (!n) return '—'
-    if (n>=10000) return n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
-    if (n>=100)   return n.toFixed(3)
-    if (n>=1)     return n.toFixed(4)
-    if (n>=.01)   return n.toFixed(5)
+  function formatPrice (n) {
+    if (n == null || isNaN(n)) return '—'
+    if (n >= 10000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    if (n >= 100)   return n.toFixed(3)
+    if (n >= 1)     return n.toFixed(4)
+    if (n >= 0.01)  return n.toFixed(5)
     return n.toFixed(6)
   }
 
-  function fmtPct(n, d=2) { return (n>=0?'+':'')+n.toFixed(d)+'%' }
-  function fmtFunding(r)   { return (r*100).toFixed(4)+'%' }
-  function fmtCountdown(ms) {
-    if (!ms||ms<=0) return '—'
-    const h=Math.floor(ms/3600000), m=Math.floor((ms%3600000)/60000), s=Math.floor((ms%60000)/1000)
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+  /**
+   * Formata volume em K/M/B.
+   * @param {number} n
+   * @returns {string}
+   */
+  function formatVolume (n) {
+    if (n == null || isNaN(n)) return '—'
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+    return n.toFixed(2)
   }
 
-  function _log(...a) { if (S.opts?.debug) console.log('[BinanceV2]', ...a) }
+  /**
+   * Formata variação percentual.
+   * @param {number} n
+   * @param {number} [decimals=2]
+   * @returns {string}
+   */
+  function formatChange (n, decimals) {
+    if (n == null || isNaN(n)) return '—'
+    const d = decimals ?? 2
+    return (n >= 0 ? '+' : '') + n.toFixed(d) + '%'
+  }
 
-  // ─── API ─────────────────────────────────────────────────────
+  /**
+   * Retorna a cor CSS para um valor (positivo = verde, negativo = vermelho).
+   * @param {number}  n
+   * @param {string} [positiveColor='#00d48a']
+   * @param {string} [negativeColor='#ff3860']
+   * @returns {string}
+   */
+  function priceColor (n, positiveColor, negativeColor) {
+    const pos = positiveColor || '#00d48a'
+    const neg = negativeColor || '#ff3860'
+    if (n == null || isNaN(n)) return '#888'
+    return n > 0 ? pos : n < 0 ? neg : '#888'
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     DOM HELPER — actualiza elementos HTML automaticamente
+  ════════════════════════════════════════════════════════════════ */
+
+  /**
+   * Utilitário de binding DOM.
+   * Liga o tracker a elementos HTML via atributos data-.
+   *
+   * Atributos suportados nos elementos:
+   *   data-bp-symbol="BTCUSDT"      — símbolo a monitorizar
+   *   data-bp-field="price"         — campo a exibir (price|changePct|change|high|low|volume|bidPrice|askPrice|spread)
+   *   data-bp-format="price"        — formato (price|volume|change|raw)
+   *   data-bp-color="true"          — aplica cor CSS ao elemento
+   *   data-bp-color-field="changePct" — campo usado para determinar a cor
+   *   data-bp-flash="true"          — aplica flash de cor ao actualizar
+   *
+   * @param {PriceTracker} tracker
+   * @param {Element}      [container=document]
+   * @returns {function}  função para desligar o binding
+   *
+   * @example
+   * <!-- HTML -->
+   * <span data-bp-symbol="BTCUSDT" data-bp-field="price" data-bp-format="price" data-bp-color="true" data-bp-color-field="changePct" data-bp-flash="true">—</span>
+   * <span data-bp-symbol="BTCUSDT" data-bp-field="changePct" data-bp-format="change" data-bp-color="true"></span>
+   *
+   * <!-- JS -->
+   * bindDOM(tracker)
+   */
+  function bindDOM (tracker, container) {
+    const root = container || (typeof document !== 'undefined' ? document : null)
+    if (!root) return () => {}
+
+    const formatters = {
+      price:  formatPrice,
+      volume: formatVolume,
+      change: formatChange,
+      raw:    v => v == null ? '—' : String(v),
+    }
+
+    const off = tracker.on('price', data => {
+      const els = root.querySelectorAll(`[data-bp-symbol="${data.symbol}"]`)
+      els.forEach(el => {
+        const field    = el.getAttribute('data-bp-field')    || 'price'
+        const fmt      = el.getAttribute('data-bp-format')   || 'raw'
+        const applyClr = el.getAttribute('data-bp-color')    === 'true'
+        const clrField = el.getAttribute('data-bp-color-field') || field
+        const flash    = el.getAttribute('data-bp-flash')    === 'true'
+        const prevVal  = el._bpPrev
+
+        const rawVal  = data[field]
+        const clrVal  = data[clrField]
+        const display = (formatters[fmt] || formatters.raw)(rawVal)
+
+        el.textContent = display
+
+        /* Cor dinâmica */
+        if (applyClr) {
+          el.style.color = priceColor(clrVal)
+        }
+
+        /* Flash ao mudar */
+        if (flash && prevVal !== undefined && rawVal !== prevVal) {
+          const dir = rawVal > prevVal ? 'up' : 'dn'
+          el.classList.remove('bp-flash-up', 'bp-flash-dn')
+          void el.offsetWidth /* reflow */
+          el.classList.add('bp-flash-' + dir)
+          setTimeout(() => el.classList.remove('bp-flash-up', 'bp-flash-dn'), 700)
+        }
+
+        el._bpPrev = rawVal
+      })
+    })
+
+    /* Injectar CSS de flash se não existir */
+    if (typeof document !== 'undefined' && !document.getElementById('bp-flash-css')) {
+      const style = document.createElement('style')
+      style.id    = 'bp-flash-css'
+      style.textContent = `
+        @keyframes bp-flash-up-anim { 0% { background: rgba(0,212,138,.35); } 100% { background: transparent; } }
+        @keyframes bp-flash-dn-anim { 0% { background: rgba(255,56,96,.35); } 100% { background: transparent; } }
+        .bp-flash-up { animation: bp-flash-up-anim .65s ease-out; }
+        .bp-flash-dn { animation: bp-flash-dn-anim .65s ease-out; }
+      `
+      document.head.appendChild(style)
+    }
+
+    return off
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     API PÚBLICA
+  ════════════════════════════════════════════════════════════════ */
 
   return {
-    start, stop, restart,
-    on, off,
-    getAll, getSummary,
-    getEntry: (sym, mkt='spot') => { const e=S.entries[mkt].get(sym); return e?snap(e):null },
-    subscribeBook, unsubscribeBook,
-    futApiRequest,
-    fmtVol, fmtPrice, fmtPct, fmtFunding, fmtCountdown,
-    get symbols()  { return { spot:[...S.symbols.spot], futures:[...S.symbols.futures] } },
-    get running()  { return S.running },
-    get version()  { return '4.0.0' },
+    /* Criação de instância */
+    create,
+
+    /* Formatadores */
+    formatPrice,
+    formatVolume,
+    formatChange,
+    priceColor,
+
+    /* DOM binding */
+    bindDOM,
+
+    /* Constantes */
+    ENDPOINTS,
+    VERSION: '1.0.0',
   }
 }))
+
+/* ════════════════════════════════════════════════════════════════════
+   EXEMPLOS DE USO
+   ─────────────────────────────────────────────────────────────────
+
+   ──── 1. Básico — actualizar preço de BTC ────────────────────────
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT'])
+   tracker.on('price', data => {
+     document.getElementById('price').textContent = BinancePrice.formatPrice(data.price)
+   })
+
+   ──── 2. Com DOM binding automático ──────────────────────────────
+   <!-- HTML -->
+   <span data-bp-symbol="BTCUSDT" data-bp-field="price"
+         data-bp-format="price" data-bp-color="true"
+         data-bp-color-field="changePct" data-bp-flash="true">—</span>
+   <span data-bp-symbol="BTCUSDT" data-bp-field="changePct"
+         data-bp-format="change" data-bp-color="true">—</span>
+   <!-- JS -->
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT', 'ETHUSDT', 'SOLUSDT'])
+   BinancePrice.bindDOM(tracker)  // auto-actualiza todos os elementos data-bp-*
+
+   ──── 3. Múltiplos mercados ───────────────────────────────────────
+   const spotTracker = BinancePrice.create({ market: 'spot' })
+   const futTracker  = BinancePrice.create({ market: 'futures' })
+   await spotTracker.start(['BTCUSDT', 'ETHUSDT'])
+   await futTracker.start(['BTCUSDT', 'ETHUSDT'])
+   spotTracker.on('price', data => console.log('SPOT', data.symbol, data.price))
+   futTracker.on('price', data => console.log('FUTURES', data.symbol, data.price, 'FR:', data.fundingRate))
+
+   ──── 4. Bid/Ask em tempo real ────────────────────────────────────
+   const tracker = BinancePrice.create({ priceStream: 'book' })
+   await tracker.start(['BTCUSDT'])
+   tracker.on('price', ({ symbol, bidPrice, askPrice, spread, spreadPct }) => {
+     console.log(`${symbol} BID: ${bidPrice} ASK: ${askPrice} SPREAD: ${spreadPct.toFixed(4)}%`)
+   })
+
+   ──── 5. Trades individuais (buy/sell) ───────────────────────────
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT'])
+   tracker.subscribeTrades(['BTCUSDT', 'ETHUSDT'])
+   tracker.on('trade', ({ symbol, price, qty, isBuy }) => {
+     console.log(symbol, isBuy ? 'BUY' : 'SELL', price, qty)
+   })
+
+   ──── 6. Velas em tempo real ──────────────────────────────────────
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT'])
+   tracker.subscribeKline('BTCUSDT', '1h')
+   tracker.on('kline', ({ symbol, interval, open, high, low, close, isClosed }) => {
+     if (isClosed) console.log('Vela fechada:', symbol, interval, close)
+   })
+
+   ──── 7. Order book ───────────────────────────────────────────────
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT'])
+   tracker.subscribeDepth('BTCUSDT', 10, 100)  // 10 níveis, 100ms
+   tracker.on('depth', ({ symbol, bids, asks }) => {
+     console.log('Melhor bid:', bids[0], 'Melhor ask:', asks[0])
+   })
+
+   ──── 8. Adicionar/remover símbolos em runtime ───────────────────
+   const tracker = BinancePrice.create()
+   await tracker.start(['BTCUSDT'])
+   await tracker.subscribe(['ETHUSDT', 'SOLUSDT'])  // adicionar
+   tracker.unsubscribe(['BTCUSDT'])                 // remover
+
+   ──── 9. Obter snapshot actual ────────────────────────────────────
+   const data = tracker.getPrice('BTCUSDT')
+   console.log(data.price, data.changePct, data.volume)
+   const all = tracker.getAllPrices()
+   all.sort((a,b) => b.changePct - a.changePct).slice(0,5)  // top gainers
+
+   ──── 10. Futures — mark price + funding rate ────────────────────
+   const tracker = BinancePrice.create({ market: 'futures', priceStream: 'mini' })
+   await tracker.start(['BTCUSDT', 'ETHUSDT'])
+   tracker.on('price', data => {
+     if (data.markPrice) {
+       console.log(data.symbol, 'Mark:', data.markPrice, 'FR:', (data.fundingRate*100).toFixed(4)+'%')
+     }
+   })
+
+════════════════════════════════════════════════════════════════════ */
